@@ -2,15 +2,15 @@ name: kufar-monitor
 
 on:
   schedule:
-     - cron: "2-57/5 * * * *"   # раз в 5 минут (чаще GitHub не позволяет)
-  workflow_dispatch:         # кнопка «Run workflow» для ручного запуска
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
 
 permissions:
-  contents: write            # чтобы сохранять seen.json обратно в репозиторий
+  contents: write
 
 concurrency:
   group: kufar-monitor
-  cancel-in-progress: false  # запуски не накладываются друг на друга
+  cancel-in-progress: false
 
 jobs:
   check:
@@ -38,4 +38,6 @@ jobs:
           git config user.name "kufar-bot"
           git config user.email "kufar-bot@users.noreply.github.com"
           git add seen.json
-          git diff --cached --quiet || (git commit -m "update seen" && git push)
+          git diff --cached --quiet && exit 0
+          git commit -m "update seen"
+          git push || (git pull --rebase -X theirs && git push)
