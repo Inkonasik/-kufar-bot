@@ -1,0 +1,77 @@
+name: kufar-monitor
+
+on:
+  workflow_dispatch:   # запуск раз в 5 минут делает cron-job.org (и кнопка «Run workflow» вручную)
+
+permissions:
+  contents: write      # чтобы сохранять seen.json обратно в репозиторий
+
+concurrency:
+  group: kufar-monitor
+  cancel-in-progress: false   # идущий запуск не прерываем; если запуски копятся, в очереди остаётся только самый новый
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10       # зависший запуск не блокирует следующие дольше 10 минут
+
+    steps:
+      - name: Получить код репозитория
+        uses: actions/checkout@v7
+
+      - name: Установить Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Установить зависимости
+        timeout-minutes: 3
+        run: python -m pip install -r requirements.txt
+
+      - name: Проверить Куфар и отправить новые объявления
+        timeout-minutes: 6
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Необязательные настройки оценки перепродажи: Settings → Secrets and variables → Actions → Variables.
+          # Если переменной нет, значение пустое и бот берёт настройку по умолчанию.
+          HOME_REGION: ${{ vars.HOME_REGION }}
+          REPAIR_COSTS: ${{ vars.REPAIR_COSTS }}
+          EXTRA_COSTS_BYN: ${{ vars.EXTRA_COSTS_BYN }}
+          MIN_PROFIT_BYN: ${{ vars.MIN_PROFIT_BYN }}
+        run: python kufar_bot.py --once
+
+      # always(): даже если шаг выше упал или завершился по таймауту, уже обработанные объявления сохраняются
+      # (бот пишет seen.json после каждого отправленного сообщения), и они не придут повторно
+      - name: Сохранить список просмотренных объявлений
+        if: always()
+        run: |
+          git config user.name "kufar-bot"
+          git config user.email "kufar-bot@users.noreply.github.com"
+
+          if [ ! -f seen.json ]; then
+            echo "Файла seen.json нет (бот не успел его создать) — сохранять нечего."
+            exit 0
+          fi
+
+          git add -- seen.json
+
+          if git diff --cached --quiet; then
+            echo "Изменений в seen.json нет."
+            exit 0
+          fi
+
+          git commit -m "update seen"
+
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "Push не прошёл (попытка $attempt из 3): в main появились новые коммиты. Подтягиваю их и повторяю."
+            git pull --rebase -X theirs origin main || git rebase --abort || true
+            sleep 3
+          done
+
+          echo "Не удалось сохранить seen.json."
+          exit 1
