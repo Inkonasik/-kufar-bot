@@ -13,9 +13,10 @@
 Что ищет (по умолчанию): iPhone 2G…11 (включая X/XR/XS/XS Max), iPhone SE 2016–2022, iPod touch, Galaxy S1–S9.
 iPhone 12 и новее, Galaxy S10 и новее, планшеты, чехлы/стёкла/запчасти и «куплю» отбрасываются.
 
-К каждому объявлению бот добавляет: разбор (память, состояние, дефекты, аккумулятор, блокировка, комплект, торг),
-сравнение цены с РЕАЛЬНЫМИ активными объявлениями Куфара той же модели (это цены объявлений, а не сделок),
-целевую цену покупки и расчёт перепродажи (за сколько выставлять, быстро продать, максимум покупки, прибыль).
+К каждому объявлению бот добавляет: разбор (память, состояние, дефекты, аккумулятор, блокировка, комплект, торг, видимое на фото),
+сравнение цены с РЕАЛЬНЫМИ активными объявлениями Куфара той же модели по категориям состояния (исправные / не подтверждено /
+небольшие дефекты / заметные дефекты / неисправные; это цены объявлений, а не сделок) и два расчёта перепродажи: без ремонта и
+с ремонтом — с тремя уровнями цены покупки (желательная, максимальная, отказ), ожидаемой прибылью и доходностью.
 Если данных не хватает, бот пишет конкретно, чего именно (мало аналогов, дефекты у аналогов не подтверждены, не известна цена
 ремонта), всё равно показывает рыночные ориентиры с пометкой «уверенность низкая» и заканчивает оценку одним выводом:
 «Покупать по текущей цене» / «Покупать только после торга до N BYN» / «Не покупать для перепродажи» /
@@ -38,16 +39,23 @@ iPhone 12 и новее, Galaxy S10 и новее, планшеты, чехлы/
   MARKET_MAX_REFRESH сколько моделей обновлять за один запуск (6)
   MARKET_SIZE        сколько объявлений-аналогов запрашивать по модели (100)
   MIN_COMPS          меньше стольких аналогов — оценка «приблизительная», вывод «пока недостаточно данных» (5; для аналогов с таким же дефектом — 3)
-  MIN_PROFIT_BYN     целевая прибыль на одну сделку перепродажи, BYN (15)
+  TARGET_PROFIT_BYN  целевая ЧИСТАЯ прибыль на одну сделку, BYN. Не задана — берётся большее из MIN_PROFIT_BYN и MIN_PROFIT_PCT %
+  MIN_PROFIT_BYN     минимальная целевая прибыль на сделку, BYN (15)
   MIN_PROFIT_PCT     …или столько процентов от цены быстрой продажи — берётся большее (12)
   EXTRA_COSTS_BYN    прочие расходы на сделку в BYN: дорога, упаковка… (0)
-  REPAIR_COSTS       известные цены ремонта в BYN, JSON, например {"screen": 80, "battery": 40}. Бот сам цену ремонта не придумывает:
-                     пока она не задана, лимит покупки показывается формулой и помечается «предварительный»
+  RISK_RESERVE_PCT   резерв на непроверенные функции (скрытые неисправности), % от цены быстрой продажи (5)
+  REPAIR_OVERRUN_PCT запас на удорожание ремонта из-за скрытых повреждений, % от цены ремонта (15)
+  REPAIR_COSTS       известные цены ремонта в BYN, JSON: число, диапазон [мин, макс] или запчасти и работа отдельно, например
+                     {"screen": [70, 100], "battery": 40, "camera": {"parts": 40, "labor": [20, 30]}}. Бот сам цену ремонта не
+                     придумывает: пока она не задана, максимум покупки показывается формулой и помечается «предварительный»,
+                     а вместо цены ремонта бот считает, при какой цене ремонт ещё выгоднее продажи «как есть»
+  PHOTOS_MAX         сколько фото объявления смотрит нейросеть (4; 0 = фото не анализировать; нужен GEMINI_API_KEY или ANTHROPIC_API_KEY)
   HOME_REGION        где продаёшь, например «минск»: аналоги из этого региона в приоритете при оценке цены и перепродажи
                      (если не задан — берётся регион самого объявления)
   RUN_BUDGET_S       сколько секунд отводится на один запуск --once (200)
   KUFAR_PAUSE        пауза между запросами к Куфару, сек (0.4)
 """
+import base64
 import html
 import json
 import os
@@ -100,7 +108,7 @@ CATEGORY = 17010  # Мобильные телефоны
 SEEN_FILE = Path(__file__).with_name("seen.json")
 HISTORY = {}  # id объявления -> запись для недельной аналитики (хранится в seen.json)
 STATE = {"market": {}, "baseline": [], "notice": 0, "pending": {}}  # кеш аналогов, «запомненные» запросы, версия уведомления, очередь повторов
-RUN = {"deadline": 0.0, "cards": 0, "card_fails": 0}  # состояние текущего запуска: крайнее время, счётчики запросов карточек
+RUN = {"deadline": 0.0, "cards": 0, "card_fails": 0, "img_fails": 0}  # состояние текущего запуска: крайнее время, счётчики запросов карточек
 
 
 def _env_float(name, default):
@@ -125,7 +133,11 @@ MIN_COMPS = int(_env_float("MIN_COMPS", 5))            # меньше анало
 MIN_PROFIT_BYN = _env_float("MIN_PROFIT_BYN", 15)      # целевая прибыль на сделку перепродажи, BYN
 MIN_PROFIT_PCT = _env_float("MIN_PROFIT_PCT", 12)      # …или столько процентов от цены быстрой продажи (берётся большее)
 EXTRA_COSTS_BYN = _env_float("EXTRA_COSTS_BYN", 0)     # прочие расходы на сделку (дорога, упаковка…), по умолчанию 0
-REPAIR_COSTS = _env_json("REPAIR_COSTS")               # известные цены ремонта, напр. {"screen": 80, "battery": 40}
+REPAIR_COSTS = _env_json("REPAIR_COSTS")               # известные цены ремонта: {"screen": 80, "battery": [30, 50], "camera": {"parts": 40, "labor": [20, 30]}}
+TARGET_PROFIT_BYN = _env_float("TARGET_PROFIT_BYN", 0) # >0: фиксированная целевая чистая прибыль на сделку, BYN (иначе max(MIN_PROFIT_BYN, MIN_PROFIT_PCT %))
+RISK_RESERVE_PCT = _env_float("RISK_RESERVE_PCT", 5)   # резерв на непроверенные функции (скрытые неисправности), % от цены быстрой продажи
+REPAIR_OVERRUN_PCT = _env_float("REPAIR_OVERRUN_PCT", 15)  # запас на удорожание ремонта из-за скрытых повреждений, % от его цены
+PHOTOS_MAX = int(_env_float("PHOTOS_MAX", 4))          # сколько фото объявления смотрит нейросеть (0 = фото не анализировать)
 HOME_REGION = os.getenv("HOME_REGION", "").strip().lower()  # где продаёшь (напр. «минск»): аналоги оттуда в приоритете
 RUN_BUDGET_S = _env_float("RUN_BUDGET_S", 200)         # сколько секунд на один запуск --once
 KUFAR_PAUSE = _env_float("KUFAR_PAUSE", 0.4)           # пауза между запросами к Куфару
@@ -261,20 +273,26 @@ def basic_filter(ad):
 
 # ---------- Нейросеть (необязательно) ----------
 
-def _llm_call(prompt, max_tokens=400, json_mode=False):
-    """Текст ответа нейросети: Gemini, если есть GEMINI_API_KEY, иначе Claude. При ошибке бросает исключение."""
+def _llm_call(prompt, max_tokens=400, json_mode=False, images=None):
+    """Текст ответа нейросети: Gemini, если есть GEMINI_API_KEY, иначе Claude. images — [(mime, байты)]: в запрос уходят сами
+    картинки (base64), а не ссылки на них. При ошибке бросает исключение."""
+    images = images or []
+    timeout = 60 if images else 30
     if GEMINI_KEY:
         config = {"maxOutputTokens": max_tokens}
         if json_mode:
             config["responseMimeType"] = "application/json"
+        parts = [{"text": prompt}] + [{"inline_data": {"mime_type": m, "data": base64.b64encode(b).decode("ascii")}} for m, b in images]
         r = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
             headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"},
-            json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": config},
-            timeout=30,
+            json={"contents": [{"parts": parts}], "generationConfig": config},
+            timeout=timeout,
         )
         r.raise_for_status()
         return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+    content = [{"type": "image", "source": {"type": "base64", "media_type": m, "data": base64.b64encode(b).decode("ascii")}}
+               for m, b in images] + [{"type": "text", "text": prompt}]
     r = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -282,8 +300,8 @@ def _llm_call(prompt, max_tokens=400, json_mode=False):
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         },
-        json={"model": LLM_MODEL, "max_tokens": max_tokens, "messages": [{"role": "user", "content": prompt}]},
-        timeout=30,
+        json={"model": LLM_MODEL, "max_tokens": max_tokens, "messages": [{"role": "user", "content": content if images else prompt}]},
+        timeout=timeout,
     )
     r.raise_for_status()
     return r.json()["content"][0]["text"]
@@ -710,6 +728,11 @@ _BARGAIN_YES = re.compile(r"торг\w*|уступлю|сброшу|скидк\w
 _NEGOTIABLE = re.compile(r"договорн\w+")
 _REFURB = re.compile(r"восстановленн\w+|refurb\w*|реф(?![а-я])|reburb")
 _SEALED = re.compile(r"запечатан\w*|sealed|не\s+вскрывался|не\s+активирован\w*|новый\s+в\s+плен\w+|новый\s+в\s+упаковк\w+")
+# Явное подтверждение хорошего состояния (слова «хорошее состояние» сюда не входят: за ними могут стоять царапины)
+_GOOD = re.compile(r"идеал\w*|отличн\w+\s+состоян\w*|состояни\w*\s+(?:отличн|идеальн)\w*|как\s+нов\w+|без\s+(?:дефект\w*|царапин\w*|сколов|трещин\w*|проблем)|"
+                   r"вс[её]\s+работает|полностью\s+(?:исправ\w+|рабоч\w+)")
+_BOX_NO = re.compile(r"без\s+(?:коробк\w*|комплекта)|только\s+телефон|телефон\s+без\s+всего")
+_BOX = re.compile(r"коробк\w*|полн\w+\s+комплект\w*|полная\s+комплектац\w*|оригинальн\w+\s+упаковк\w*")
 
 
 def parse_memory(text):
@@ -810,6 +833,8 @@ def rule_facts(ad):
     return {
         "label": label, "mem": mem, "cond": cond, "defects": defects, "battery_pct": bat, "bargain": bargain,
         "negotiable_price": bool(_NEGOTIABLE.search(full)), "kit": kit_from_text(full), "desc": desc,
+        "good": is_good(full), "box": has_box(full),
+        "photo": {"status": "none", "n": 0, "total": len(image_refs(ad)), "findings": [], "kit": [], "mismatch": "", "quality": ""},
         "region": param(ad, "region") or "", "area": param(ad, "area") or "",
         "seller": "магазин" if ad.get("company_ad") else "частник",
         "price": price_byn(ad), "is_phone": True, "summary": "", "risks": [], "llm": False, "repair_cost": None,
@@ -819,6 +844,66 @@ def rule_facts(ad):
 
 def max_severity(defects):
     return max((SEVERITY.get(c, 0) for c in defects), default=-1)
+
+
+# ---------- Фото объявления: скачиваем и отдаём нейросети КАРТИНКИ (не ссылки) ----------
+
+MAX_IMG_BYTES = 1_500_000
+IMG_TYPES = ("image/jpeg", "image/png", "image/webp")
+
+
+def image_refs(ad):
+    """[(путь, yams)] из поля images объявления. Куфар отдаёт пути вида adim1/<uuid>.jpg."""
+    out = []
+    for im in ad.get("images") or []:
+        if isinstance(im, dict) and isinstance(im.get("path"), str) and im["path"]:
+            out.append((im["path"].lstrip("/"), bool(im.get("yams_storage")) or im.get("media_storage") == "yams"))
+        elif isinstance(im, str) and im:
+            out.append((im.lstrip("/"), False))
+    return out
+
+
+def image_urls(path, yams):
+    """Возможные адреса одной картинки на CDN Куфара (формат проверяется при запуске: подходящий берётся автоматически)."""
+    rms = [f"https://rms.kufar.by/v1/gallery/{path}", f"https://rms.kufar.by/v1/list_thumbs_2x/{path}"]
+    yam = [f"https://yams.kufar.by/api/v1/kufar-ads/images/{path}?rule=gallery",
+           f"https://yams.kufar.by/api/v1/kufar-ads/images/{path}?rule=list_thumbs_2x"]
+    return yam + rms if yams else rms + yam
+
+
+def _download_image(path, yams):
+    for url in image_urls(path, yams):
+        try:
+            r = http_get(url, timeout=12, tries=1)
+        except Exception:
+            continue
+        ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if r.status_code == 200 and ctype in IMG_TYPES and 0 < len(r.content) <= MAX_IMG_BYTES:
+            return ctype, r.content
+    return None
+
+
+def fetch_photos(ad):
+    """(фото, причина). фото — [(mime, байты)] до PHOTOS_MAX штук; причина: '' / 'off' / 'no_photos' / 'no_download'.
+    Если у объявления ни одна картинка не загрузилась 3 раза подряд, остаток запуска фото не качаем."""
+    if PHOTOS_MAX <= 0:
+        return [], "off"
+    refs = image_refs(ad)
+    if not refs:
+        return [], "no_photos"
+    if RUN.get("img_fails", 0) >= 3:
+        return [], "no_download"
+    got = []
+    for path, yams in refs[:PHOTOS_MAX]:
+        if RUN["deadline"] and time.time() > RUN["deadline"]:
+            break
+        img = _download_image(path, yams)
+        if img:
+            got.append(img)
+        elif not got:
+            break  # первая картинка не загрузилась — остальные пробовать нет смысла
+    RUN["img_fails"] = 0 if got else RUN.get("img_fails", 0) + 1
+    return got, ("" if got else "no_download")
 
 
 # ---------- Нейросеть: разбор объявления одним запросом (JSON) ----------
@@ -832,10 +917,10 @@ def llm_enabled():
     return bool(GEMINI_KEY or ANTHROPIC_KEY) and not _LLM["off"]
 
 
-def llm_json(prompt, max_tokens=700):
+def llm_json(prompt, max_tokens=700, images=None):
     """Вызов нейросети с JSON-ответом. После 2 подряд ошибок (или лимита 429) отключается до конца запуска."""
     try:
-        text = _llm_call(prompt, max_tokens, json_mode=True)
+        text = _llm_call(prompt, max_tokens, json_mode=True, **({"images": images} if images else {}))
         data = json.loads(text[text.index("{"): text.rindex("}") + 1])
         _LLM["fails"] = 0
         return data if isinstance(data, dict) else None
@@ -848,10 +933,30 @@ def llm_json(prompt, max_tokens=700):
         return None
 
 
+PHOTO_SCHEMA = (', "photos": {"findings": [{"part": "экран|задняя крышка|рамка/корпус|камера|разъём|следы вскрытия|другое", '
+                '"kind": "screen|cosmetic|camera|opened|other", "what": "что именно видно, коротко", '
+                '"confidence": "высокая|средняя|низкая", "check": "что проверить при осмотре"}], '
+                '"kit_visible": [], "mismatch": "", "quality": "хорошее|среднее|плохое"}')
+PHOTO_RULES = (
+    "\nК объявлению приложены фотографии (по порядку). Заполни поле photos. ПРАВИЛА для фото: описывай ТОЛЬКО то, что действительно видно. "
+    "По фото НЕЛЬЗЯ определить исправность функций (Face ID/Touch ID, iCloud и блокировки, ёмкость аккумулятора, работу камер, динамиков, "
+    "микрофона, сети, зарядки) — не заявляй об этом. Можно: трещины, сколы, царапины, вмятины, деформацию рамки, следы вскрытия, "
+    "пятна и выгорание на экране (если видно), состояние задней крышки и камеры снаружи, видимые аксессуары. "
+    "findings — по одному элементу на каждый видимый дефект; если видимых дефектов нет — пустой массив. "
+    "Если фото тёмные, размытые или их мало — quality=плохое и не гадай. kit_visible — только то, что видно на фото "
+    "(коробка, зарядное устройство/кабель, наушники, чехол, защитное стекло, документы/чек); не утверждай, что аксессуары оригинальные. "
+    "mismatch — только если фото противоречат описанию (например, в тексте «идеал», а на экране трещина), иначе пустая строка."
+)
+
+
 def llm_analyze(ad, facts):
-    """Нейросеть читает объявление и возвращает структурированные факты. Без ключа/при ошибке — None."""
+    """Нейросеть читает объявление (и его фото, если они скачались) и возвращает структурированные факты.
+    Без ключа/при ошибке — None. Состояние разбора фото записывается в facts['photo']['status']."""
+    ph = facts["photo"]
     if not llm_enabled():
+        ph["status"] = "no_llm"
         return None
+    images, why = fetch_photos(ad)
     info = (
         f"Название: {ad.get('subject')}\n"
         f"Цена: {facts['price']:.0f} BYN" + (" (0 = не указана/договорная)" if not facts["price"] else "") + "\n"
@@ -861,20 +966,35 @@ def llm_analyze(ad, facts):
         f"Модель по нашему определению: {facts['label']}\n"
         f"Описание: {facts['desc'] or 'в данных нет (только название)'}"
     )
-    prompt = (
-        "Ты помогаешь покупать и перепродавать телефоны на Куфаре (Беларусь). Разбери объявление.\n\n" + info + "\n\n"
+    head = "Ты помогаешь покупать и перепродавать телефоны на Куфаре (Беларусь). Разбери объявление.\n\n" + info + "\n\n"
+    schema = (
         "Ответь ТОЛЬКО JSON такого вида (все тексты по-русски, коротко):\n"
         '{"is_phone": true, "memory_gb": null, "condition": "новый|б/у|восстановленный|неисправный|на запчасти|не указано", '
         '"defects": [{"type": "' + "|".join(_DEFECT_TYPES) + '", "note": "что именно"}], '
         '"screen": "не указано", "body": "не указано", "battery_pct": null, "face_touch_id": "работает|не работает|не указано", '
         '"lock": "нет|есть|не указано", "kit": [], "bargain": "торг|без торга|не указано", "repair_cost_byn": null, '
-        '"summary": "1-2 коротких предложения: что продаётся и на что смотреть", "risks": ["до 3 коротких рисков"]}\n'
+        '"summary": "1-2 коротких предложения: что продаётся и на что смотреть", "risks": ["до 3 коротких рисков"]@@PHOTOS@@}\n'
+    )
+    rules = (
         "Правила: is_phone=false, только если продаётся НЕ целый телефон (чехол, стекло, коробка, запчасти для телефона, услуга, «куплю»); "
         "телефон «на запчасти» — это is_phone=true с дефектом parts. НЕ ВЫДУМЫВАЙ: чего нет в тексте — null или «не указано». "
         "repair_cost_byn заполняй только если продавец прямо назвал стоимость ремонта в BYN. Дефект записывай, только если он назван "
         "в объявлении; «без царапин», «icloud чистый» дефектами не считаются."
     )
-    return llm_json(prompt, 700)
+    text_prompt = head + schema.replace("@@PHOTOS@@", "") + rules
+    if not images:
+        ph["status"] = why or "none"
+        return llm_json(text_prompt, 700)
+    data = llm_json(head + schema.replace("@@PHOTOS@@", PHOTO_SCHEMA) + rules + PHOTO_RULES, 1100, images=images)
+    if isinstance(data, dict) and isinstance(data.get("photos"), dict):
+        ph.update(status="analyzed", n=len(images))
+        return data
+    ph["status"] = "error"  # запрос с фото не прошёл или ответ без разбора фото — разбираем хотя бы текст
+    if data is None and not _LLM["off"]:
+        return llm_json(text_prompt, 700)
+    if isinstance(data, dict):
+        data.pop("photos", None)
+    return data
 
 
 def merge_llm(facts, data):
@@ -910,7 +1030,37 @@ def merge_llm(facts, data):
     facts["body"] = str(data.get("body") or "")[:80]
     facts["face_touch"] = str(data.get("face_touch_id") or "")[:20]
     facts["lock_text"] = str(data.get("lock") or "")[:20]
+    if facts["photo"].get("status") == "analyzed" and isinstance(data.get("photos"), dict):
+        merge_photos(facts, data["photos"])
     return facts
+
+
+PHOTO_KINDS = ("screen", "cosmetic", "camera", "opened", "other")
+PHOTO_KIT = ("коробка", "зарядное устройство/кабель", "наушники", "чехол", "защитное стекло", "документы/чек")
+CONF_RU = ("высокая", "средняя", "низкая")
+
+
+def merge_photos(facts, ph):
+    """Что нейросеть увидела на фото. В дефекты попадает только то, в чём она уверена («высокая») и если фото нормального качества;
+    остальное показывается как «возможно, проверить». Исправность функций по фото не определяется."""
+    out = facts["photo"]
+    finds = []
+    for f in (ph.get("findings") or [])[:6]:
+        if not isinstance(f, dict) or not str(f.get("what") or "").strip():
+            continue
+        conf = str(f.get("confidence") or "").lower()
+        finds.append({"part": str(f.get("part") or "")[:30], "kind": f.get("kind") if f.get("kind") in PHOTO_KINDS else "other",
+                      "what": str(f["what"]).strip()[:90], "conf": conf if conf in CONF_RU else "низкая",
+                      "check": str(f.get("check") or "")[:90]})
+    out["findings"] = finds
+    kit = ph.get("kit_visible")
+    out["kit"] = [x for x in kit if x in PHOTO_KIT] if isinstance(kit, list) else []
+    out["mismatch"] = str(ph.get("mismatch") or "")[:140]
+    out["quality"] = str(ph.get("quality") or "")[:20]
+    if out["quality"].lower() != "плохое":
+        for f in finds:
+            if f["conf"] == "высокая" and f["kind"] in ("screen", "cosmetic", "camera"):
+                facts["defects"].setdefault(f["kind"], "по фото: " + f["what"])
 
 
 def analyze_ad(ad):
@@ -939,6 +1089,67 @@ KIND_NAMES = {"lock": "блокировка", "water": "вода", "board": "п�
 def kinds_mask(defects):
     """Битовая маска видов дефектов из словаря {код: пометка}."""
     return sum(bit for code, bit in F_KINDS.items() if code in defects)
+
+
+# Ещё флаги аналога: мелкие дефекты без «вида» (царапины, замена экрана, был ремонт), явное «идеал/всё работает», коробка.
+F_COSM, F_GOOD, F_BOX = 1 << 15, 1 << 16, 1 << 17
+KIND_FAULT = sum(F_KINDS[k] for k in ("lock", "water", "board", "charging", "biometric", "comms"))
+KIND_VISIBLE = F_KINDS["screen"] | F_KINDS["camera"]
+# Категории состояния от лучшей к худшей. «ok» — исправность подтверждена словами («идеал», «всё работает»);
+# «unk» — дефекты не названы, но и исправность не подтверждена: по умолчанию большинство объявлений именно такие.
+CATS = ("ok", "unk", "minor", "visible", "faulty")
+CAT_NAMES = {"ok": "исправные", "unk": "состояние не подтверждено", "minor": "небольшие дефекты",
+             "visible": "заметные дефекты", "faulty": "неисправные"}
+CAT_LEVEL = {"ok": 0, "unk": 0, "minor": 1, "visible": 2, "faulty": 3}  # «глубина» повреждения для расчёта между категориями
+
+
+def is_good(text):
+    """Явное подтверждение хорошего состояния в тексте (не «не идеал»)."""
+    t = " ".join((text or "").lower().replace("ё", "е").split())
+    return any(not _NEG_BEFORE.search(t[max(0, m.start() - 14):m.start()]) for m in _GOOD.finditer(t))
+
+
+def has_box(text):
+    """В тексте названа коробка / полный комплект (и не написано «без коробки»)."""
+    t = " ".join((text or "").lower().split())
+    return bool(_BOX.search(t)) and not _BOX_NO.search(t)
+
+
+def defect_flags(defects, good=False):
+    """Флаги состояния по словарю дефектов {код: пометка} — одни и те же для аналога и для самого объявления."""
+    flags = kinds_mask(defects)
+    sev = max_severity(defects)
+    if sev >= 2 or "battery" in defects:
+        flags |= F_DEF
+    if sev >= 3:
+        flags |= F_DEF | F_CRIT
+    if "parts" in defects:
+        flags |= F_PARTS
+    if any(c in defects for c in ("cosmetic", "screen_replaced", "repaired")):
+        flags |= F_COSM
+    if good and not flags:
+        flags |= F_GOOD
+    return flags
+
+
+def comp_cat(flags):
+    """Категория состояния по флагам. None — состояние не определить (дефект есть, но вид неизвестен: запись из старого кеша)."""
+    kinds = flags & sum(F_KINDS.values())
+    if flags & (F_PARTS | F_CRIT) or kinds & KIND_FAULT:
+        return "faulty"
+    if kinds & KIND_VISIBLE:
+        return "visible"
+    if flags & F_DEF and not kinds:
+        return None
+    if kinds or flags & F_COSM:  # остался только слабый аккумулятор или мелочи
+        return "minor"
+    return "ok" if flags & F_GOOD else "unk"
+
+
+def ad_cat(facts):
+    return comp_cat(defect_flags(facts["defects"], facts.get("good")))
+
+
 _MARKET_REFRESHES = {"n": 0}
 
 
@@ -994,14 +1205,9 @@ def comp_item(ad, key):
     bat = parse_battery(full)
     if bat is not None and bat < 80:
         defects.setdefault("battery", f"аккумулятор {bat}%")  # так же, как для самого объявления (rule_facts)
-    flags = kinds_mask(defects)
-    sev = max_severity(defects)
-    if sev >= 2 or "battery" in defects:
-        flags |= F_DEF
-    if sev >= 3:
-        flags |= F_DEF | F_CRIT
-    if "parts" in defects:
-        flags |= F_PARTS
+    flags = defect_flags(defects, is_good(full))
+    if has_box(full):
+        flags |= F_BOX
     cond_param = (param(ad, "condition") or "").lower()
     if "нов" in cond_param and "б/у" not in cond_param or _SEALED.search(full):
         flags |= F_NEW
@@ -1113,29 +1319,15 @@ CLEAN_KIND = "без дефектов в названии"
 SAME_KIND = "с таким же дефектом"
 
 
-def select_pool(items, facts, ad_id, region=None, force_clean=False):
-    """Подбор сопоставимых аналогов: сначала самые точные (модель + память + регион), потом шире, с пометками.
-    У аналогов видны только заголовки (описания бот не читает), поэтому «такой же дефект» = тот же вид дефекта назван в заголовке."""
+def _cands(items, facts, ad_id):
+    """Аналоги той же модели (у iPhone SE — того же поколения), без самого объявления."""
     cand = [it for it in items if it[0] != ad_id and it[1] > 0]
     gen = facts_gen(facts["label"])
-    if gen:
-        cand = [it for it in cand if it[5] == gen]
-    defects = facts["defects"]
-    sev = max_severity(defects)
-    bad = sev >= 2 or "battery" in defects
-    mem = facts["mem"]
-    reg = region_code(facts["region"]) if region is None else region
-    cond = facts["cond"] if facts["cond"] != "unknown" else "used"
-    if not force_clean and "parts" in defects:
-        base, kind = [it for it in cand if it[3] & F_PARTS], "на запчасти"
-    elif not force_clean and bad:
-        mine = kinds_mask(defects)
-        base = [it for it in cand if it[3] & F_DEF and not it[3] & F_PARTS and (it[3] & mine) == mine]
-        kind = SAME_KIND
-    else:
-        base = [it for it in cand if not it[3] & (F_DEF | F_PARTS) and _cond_ok(it[3], cond)]
-        kind = CLEAN_KIND
-    need = MIN_DEFECT_COMPS if kind != CLEAN_KIND else MIN_COMPS
+    return [it for it in cand if it[5] == gen] if gen else cand
+
+
+def _tier_pick(base, mem, reg, need, kind):
+    """Уровни подбора: сначала самые точные (память + регион), потом шире, с пометками. Частники в приоритете."""
     tiers = []  # (имя, аналоги, описание, пометки, минимум аналогов)
     reg_need = max(need, 8)  # регион сужает выборку — берём его, только если аналогов всё ещё достаточно для статистики
     if mem and reg:
@@ -1158,6 +1350,29 @@ def select_pool(items, facts, ad_id, region=None, force_clean=False):
     last = tiers[-1]  # ни один уровень не набрал минимум: отдаём самый широкий набор, решает вызывающий код
     return {"items": last[1], "kind": kind, "tier": "none", "desc": f"{kind}: {last[2]}", "place": last[2], "notes": list(last[3]),
             "need": need, "base_n": len(base), "priv": False}
+
+
+def select_pool(items, facts, ad_id, region=None, force_clean=False):
+    """Подбор сопоставимых аналогов (см. _tier_pick). Тип выборки зависит от дефектов объявления:
+    «на запчасти» / «такой же дефект» / «без пометок о дефектах в заголовке».
+    У аналогов видны только заголовки (описания бот не читает), поэтому «такой же дефект» = тот же вид дефекта назван в заголовке."""
+    cand = _cands(items, facts, ad_id)
+    defects = facts["defects"]
+    sev = max_severity(defects)
+    bad = sev >= 2 or "battery" in defects
+    reg = region_code(facts["region"]) if region is None else region
+    cond = facts["cond"] if facts["cond"] != "unknown" else "used"
+    if not force_clean and "parts" in defects:
+        base, kind = [it for it in cand if it[3] & F_PARTS], "на запчасти"
+    elif not force_clean and bad:
+        mine = kinds_mask(defects)
+        base = [it for it in cand if it[3] & F_DEF and not it[3] & F_PARTS and (it[3] & mine) == mine]
+        kind = SAME_KIND
+    else:
+        base = [it for it in cand if not it[3] & (F_DEF | F_PARTS | F_COSM) and _cond_ok(it[3], cond)]
+        kind = CLEAN_KIND
+    need = MIN_DEFECT_COMPS if kind != CLEAN_KIND else MIN_COMPS
+    return _tier_pick(base, facts["mem"], reg, need, kind)
 
 
 def rank_verdict(price, st):
@@ -1191,28 +1406,60 @@ def floor5(x):
     return max(0, int(x // 5) * 5)
 
 
-def repair_breakdown(facts):
-    """Что нужно чинить: (сумма ИЗВЕСТНЫХ расходов на ремонт, названия дефектов с неизвестной ценой ремонта, [(название, цена)]).
-    Цену ремонта бот не выдумывает: она берётся только из REPAIR_COSTS или из слов продавца (если дефект один)."""
+def _num(v):
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else None
+
+
+def _rng(v):
+    """Число или [мин, макс] -> (мин, макс); иначе None."""
+    n = _num(v)
+    if n is not None:
+        return n, n
+    if isinstance(v, (list, tuple)) and len(v) == 2:
+        lo, hi = _num(v[0]), _num(v[1])
+        if lo is not None and hi is not None:
+            return min(lo, hi), max(lo, hi)
+    return None
+
+
+def repair_range(code):
+    """Цена ремонта из REPAIR_COSTS: (мин, макс, пояснение) или None. Формы записи: 80 | [70, 110] |
+    {"parts": [40, 60], "labor": 30} (запчасти и работа отдельно, каждое — число или [мин, макс])."""
+    v = REPAIR_COSTS.get(code)
+    r = _rng(v)
+    if r:
+        return r[0], r[1], "REPAIR_COSTS"
+    if isinstance(v, dict):
+        parts, labor = _rng(v.get("parts")), _rng(v.get("labor"))
+        if parts or labor:
+            p, w = parts or (0.0, 0.0), labor or (0.0, 0.0)
+            return p[0] + w[0], p[1] + w[1], "REPAIR_COSTS: запчасти + работа"
+    return None
+
+
+def repair_plan(facts):
+    """Что нужно чинить и сколько это стоит. Цену ремонта бот не выдумывает: она берётся только из REPAIR_COSTS или из слов
+    продавца (если дефект один). Неизвестное остаётся неизвестным.
+    {"needs": [названия], "items": [{code, name, lo, hi, src}], "unknown": [названия], "lo": сумма, "hi": сумма}"""
     needs = [(c, n) for c, n in facts["defects"].items() if SEVERITY.get(c, 0) >= 1 and c not in ("repaired", "screen_replaced")]
-    known, unknown, parts = 0.0, [], []
+    items, unknown = [], []
     for c, name in needs:
-        v = REPAIR_COSTS.get(c)
-        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
-            known += float(v)
-            parts.append((name, float(v)))
+        r = repair_range(c)
+        if r:
+            items.append({"code": c, "name": name, "lo": r[0], "hi": r[1], "src": r[2]})
         elif facts.get("repair_cost") and len(needs) == 1:
-            known += float(facts["repair_cost"])
-            parts.append((f"{name}, цена по словам продавца", float(facts["repair_cost"])))
+            v = float(facts["repair_cost"])
+            items.append({"code": c, "name": name, "lo": v, "hi": v, "src": "по словам продавца"})
         else:
             unknown.append(name)
-    return known, unknown, parts
+    return {"needs": [n for _c, n in needs], "items": items, "unknown": unknown,
+            "lo": sum(i["lo"] for i in items), "hi": sum(i["hi"] for i in items)}
 
 
 def known_repair_cost(facts):
-    """Сумма известных расходов на ремонт; None, если у какого-то дефекта цена ремонта неизвестна."""
-    known, unknown, _parts = repair_breakdown(facts)
-    return None if unknown else known
+    """Верхняя граница ИЗВЕСТНЫХ расходов на ремонт; None, если у какого-то дефекта цена ремонта неизвестна."""
+    rp = repair_plan(facts)
+    return None if rp["unknown"] else rp["hi"]
 
 
 def confidence_of(n, tier, st, stale, mem_known, sev):
@@ -1260,34 +1507,213 @@ def pick_basis(items, facts, ad_id, reg):
     return "general", pool, st, info
 
 
-def resale_calc(ap, facts):
-    """Ориентиры продажи, лимит покупки и прибыль. Ожидаемая продажа — БЫСТРАЯ (нижняя четверть цен), то есть консервативная.
-    Лимит покупки = ожидаемая продажа − ремонт − прочие расходы − целевая прибыль. Ремонт вычитается ОДИН раз и только если
-    цена продажи взята «как у исправного» (общий рынок); цена аналогов с таким же дефектом уже учитывает дефект.
-    Цену ремонта не выдумываем: неизвестная остаётся неизвестной, и тогда лимит предварительный."""
-    st, price = ap["stats"], facts["price"]
-    lst, quick = rnd5(st["med"]), rnd5(st["q1"])
-    target = ceil5(max(MIN_PROFIT_BYN, MIN_PROFIT_PCT / 100 * quick))
-    if ap["basis"] == "general":
-        known, unknown, parts = repair_breakdown(facts)
+SNAP_NEED = 3  # минимум объявлений в категории, чтобы показывать медиану
+
+
+def _row(pool_items):
+    """Строка сводки: число объявлений и статистика цен (без выбросов)."""
+    st = price_stats([it[1] for it in pool_items])
+    return {"n": st["n"] if st else 0, "st": st, "items": pool_items}
+
+
+def _scope(items, mem):
+    """Один охват для сравнения категорий: та же память (если известна), вся Беларусь; частники, если их хватает.
+    Если аналогов той же памяти меньше SNAP_NEED, а всех вместе хватает — берём любую память (mixed)."""
+    same = [it for it in items if it[2] == mem] if mem else list(items)
+    mixed = False
+    if mem and len(same) < SNAP_NEED and len(items) >= SNAP_NEED:
+        same, mixed = list(items), True
+    priv = [it for it in same if not it[3] & F_SHOP]
+    shops = False
+    if len(priv) >= SNAP_NEED:
+        same = priv
     else:
-        known, unknown, parts = 0.0, [], []
-    raw = quick - EXTRA_COSTS_BYN - known - target
-    c = {"list": lst, "quick": quick, "target_profit": target, "extra": EXTRA_COSTS_BYN, "repair": known,
-         "repair_unknown": unknown, "repair_parts": parts, "raw": raw, "limit": floor5(raw), "final": not unknown}
+        shops = any(it[3] & F_SHOP for it in same)
+    row = _row(same)
+    row.update(all=len(items), mixed=mixed, shops=shops)
+    return row
+
+
+def market_snapshot(items, facts, ad_id):
+    """Цены АКТИВНЫХ объявлений той же модели по категориям состояния (CATS). Учитываются только дефекты, названные в тексте
+    аналога: «дефектов нет в заголовке» не значит «исправен», поэтому такие аналоги — категория «состояние не подтверждено»."""
+    cond = facts["cond"] if facts["cond"] != "unknown" else "used"
+    cand = [it for it in _cands(items, facts, ad_id) if _cond_ok(it[3], cond)]
+    by, undefined = {c: [] for c in CATS}, 0
+    for it in cand:
+        c = comp_cat(it[3])
+        if c is None:
+            undefined += 1  # дефект есть, а какой — неизвестно (запись из старого кеша): в категории не берём
+        else:
+            by[c].append(it)
+    return {"rows": {c: _scope(by[c], facts["mem"]) for c in CATS}, "total": len(cand), "undefined": undefined,
+            "mem": facts["mem"], "cand": cand}
+
+
+def kind_row(snap, kind):
+    """Аналоги, у которых в тексте назван дефект этого вида (и нет «на запчасти»): строка со статистикой."""
+    bit = F_KINDS[kind]
+    return _scope([it for it in snap["cand"] if it[3] & bit and not it[3] & F_PARTS], snap["mem"])
+
+
+def _interp(anchors, level):
+    """Цена «между категориями»: линейно по глубине повреждения между ближайшими категориями с данными.
+    anchors — {уровень: (быстрая, цена выставления, число объявлений)}. None, если нет данных с обеих сторон."""
+    lo = [l for l in anchors if l < level]
+    hi = [l for l in anchors if l > level]
+    if not lo or not hi:
+        return None
+    a, b = max(lo), min(hi)
+    t = (level - a) / (b - a)
+    quick = anchors[a][0] + (anchors[b][0] - anchors[a][0]) * t
+    lst = anchors[a][1] + (anchors[b][1] - anchors[a][1]) * t
+    return rnd5(quick), rnd5(lst), (a, b)
+
+
+def asis_estimate(facts, snap, clean, like):
+    """Сколько можно выручить за ЭТОТ телефон «как есть» (с его дефектами). Источники по убыванию надёжности:
+    same — аналоги с таким же дефектом (найдено на рынке); cat — аналоги той же категории состояния (дефекты могут отличаться);
+    interp — расчёт между соседними категориями (допущение, не рыночная цена); clean — аналоги без названных дефектов.
+    None — оценить не из чего. Возвращает {src, found, quick, list, n, st, cat, between}."""
+    cat = ad_cat(facts) or "unk"
+    row_ok = snap["rows"]["ok"]
+    if cat == "ok" and row_ok["st"] and row_ok["n"] >= SNAP_NEED:  # исправность названа словами — сравниваем с такими же
+        st = row_ok["st"]
+        return {"src": "ok", "found": True, "quick": rnd5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
+    if cat in ("ok", "unk"):
+        st = clean["st"] if clean else None
+        if st:
+            return {"src": "clean", "found": True, "quick": rnd5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
+        return None
+    if like and like.get("st"):
+        st = like["st"]
+        return {"src": "same", "found": True, "quick": rnd5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
+    row = snap["rows"][cat]
+    if row["st"] and row["n"] >= SNAP_NEED:
+        st = row["st"]
+        return {"src": "cat", "found": True, "quick": rnd5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
+    anchors = {}
+    if clean and clean["st"]:
+        anchors[0] = (clean["st"]["q1"], clean["st"]["med"], clean["st"]["n"])
+    for c in ("minor", "visible", "faulty"):
+        r = snap["rows"][c]
+        if c != cat and r["st"] and r["n"] >= SNAP_NEED:
+            anchors[CAT_LEVEL[c]] = (r["st"]["q1"], r["st"]["med"], r["n"])
+    mid = _interp(anchors, CAT_LEVEL[cat])
+    if mid:
+        return {"src": "interp", "found": False, "quick": mid[0], "list": mid[1], "n": 0, "st": None, "cat": cat, "between": mid[2]}
+    return None
+
+
+DESIRED_MARGIN = 1.5  # «желаемая» цена покупки: прибыль в 1,5 раза выше целевой (запас на неприятные сюрпризы)
+
+
+def target_profit(quick):
+    """Целевая чистая прибыль на сделку: TARGET_PROFIT_BYN, а если не задана — большее из MIN_PROFIT_BYN и MIN_PROFIT_PCT % от быстрой продажи."""
+    if TARGET_PROFIT_BYN > 0:
+        return float(TARGET_PROFIT_BYN)
+    return ceil5(max(MIN_PROFIT_BYN, MIN_PROFIT_PCT / 100 * quick))
+
+
+def deal_calc(quick, lst, price, rep=None, rep_unknown=(), reserve_on=True):
+    """Расчёт сделки — одна формула для обоих вариантов (без ремонта и с ремонтом); ремонт вычитается ОДИН раз.
+      расходы = прочие расходы + ремонт (верхняя граница + запас на удорожание) + резерв на непроверенные функции
+      макс. цена покупки = ожидаемая (быстрая) цена продажи − расходы − целевая прибыль
+      желаемая цена      = то же, но прибыль в DESIRED_MARGIN раза выше целевой
+      цена отказа        = безубыточность при продаже по цене выставления (оптимистично: нижняя граница ремонта)
+    quick — консервативная продажа (нижняя четверть цен аналогов), lst — цена выставления (медиана).
+    rep — (мин, макс) ИЗВЕСТНОГО ремонта или None; rep_unknown — дефекты, цена ремонта которых не известна: тогда расчёт
+    «до учёта ремонта» (final=False), а лимит предварительный."""
+    lo, hi = rep if rep else (0.0, 0.0)
+    target = target_profit(quick)
+    reserve = ceil5(RISK_RESERVE_PCT / 100 * quick) if reserve_on and RISK_RESERVE_PCT > 0 else 0
+    over = hi * REPAIR_OVERRUN_PCT / 100
+    costs = EXTRA_COSTS_BYN + hi + over + reserve  # консервативные расходы
+    costs_opt = EXTRA_COSTS_BYN + lo + reserve     # оптимистичные расходы
+    c = {"quick": quick, "list": lst, "target": target, "extra": EXTRA_COSTS_BYN, "rep_lo": lo, "rep_hi": hi, "overrun": over,
+         "reserve": reserve, "costs": costs, "costs_opt": costs_opt, "rep_unknown": list(rep_unknown), "final": not rep_unknown,
+         "raw": quick - costs - target, "desired": floor5(quick - costs - DESIRED_MARGIN * target),
+         "limit": floor5(quick - costs - target), "walk": floor5(lst - costs_opt)}
     if price:
-        c["profit_quick"] = quick - price - EXTRA_COSTS_BYN - known
-        c["profit_list"] = lst - price - EXTRA_COSTS_BYN - known
-        c["reserve"] = c["limit"] - price  # запас до лимита (для неизвестного ремонта — сколько на него можно потратить)
+        c["profit"], c["profit_opt"] = quick - price - costs, lst - price - costs_opt
+        c["roi"] = c["profit"] / (price + costs) if price + costs > 0 else None
+        c["roi_opt"] = c["profit_opt"] / (price + costs_opt) if price + costs_opt > 0 else None
+        c["gap"] = c["limit"] - price  # запас до максимальной цены (минус — цена выше)
     return c
+
+
+def unconfirmed_checks(facts, title=""):
+    """Что в объявлении не подтверждено и проверяется только при осмотре. Если список не пуст — в расчёте есть резерв на скрытые неисправности."""
+    out = []
+    phone = facts["label"].startswith("iPhone")
+    if lock_status(facts, title) is None:
+        out.append("блокировка (iCloud/активация)" if facts["label"].startswith(("iPhone", "iPod")) else "блокировка (Google-аккаунт, оператор)")
+    if phone and bio_status(facts, title) is None:
+        out.append("Face ID/Touch ID")
+    if facts["battery_pct"] is None:
+        out.append("износ аккумулятора")
+    if not facts.get("good"):
+        out.append("камеры, динамики, микрофон, разъём зарядки, кнопки, сеть")
+    return out
+
+
+def build_plan(ad, facts, snap, clean, like):
+    """Два варианта сделки и три уровня цены покупки (желаемая / максимальная / отказ). Всё считается из найденных аналогов;
+    цены ремонта — только из REPAIR_COSTS или слов продавца.
+      A — купить и перепродать как есть (по цене телефонов в том же состоянии);
+      B — купить, отремонтировать и продать как исправный (по цене исправных аналогов).
+    Варианта «В» (отказаться) в расчёте нет: он наступает, когда цена выше максимума."""
+    price = facts["price"]
+    unconf = unconfirmed_checks(facts, ad.get("subject") or "")
+    asis = asis_estimate(facts, snap, clean, like)
+    rp = repair_plan(facts)
+    crit = [n for c, n in facts["defects"].items() if SEVERITY.get(c, 0) >= 3]
+    plan = {"unconfirmed": unconf, "asis": asis, "repair": rp, "crit": crit, "A": None, "B": None, "best": None, "breakeven": None,
+            "sens": [], "upper": None}
+    reserve_on = bool(unconf)
+    if asis:
+        plan["A"] = deal_calc(asis["quick"], asis["list"], price, None, (), reserve_on)
+    if rp["needs"] and not crit and clean and clean["st"]:
+        cq, cl = rnd5(clean["st"]["q1"]), rnd5(clean["st"]["med"])
+        known = (rp["lo"], rp["hi"]) if rp["items"] else None
+        plan["B"] = deal_calc(cq, cl, price, known, rp["unknown"], True)
+        plan["B"]["clean_n"] = clean["st"]["n"]
+        if plan["A"]:
+            free = deal_calc(cq, cl, price, (0.0, 0.0), (), True)  # макс. цена, если бы ремонт был бесплатным
+            be = floor5((free["limit"] - plan["A"]["limit"]) / (1 + REPAIR_OVERRUN_PCT / 100))
+            plan["breakeven"] = be  # при ремонте дороже этой суммы выгоднее продать как есть
+            if rp["unknown"] and be > 0:
+                for r in sorted({floor5(be / 2), be, floor5(be * 1.5)}):
+                    plan["sens"].append((r, deal_calc(cq, cl, price, (float(r), float(r)), (), True)["limit"]))
+    if not plan["A"] and not plan["B"] and not crit and clean and clean["st"]:
+        # состояние телефона оценить не из чего, но продать дороже исправного он не сможет: считаем только верхнюю границу
+        plan["upper"] = deal_calc(rnd5(clean["st"]["q1"]), rnd5(clean["st"]["med"]), price, None, (), reserve_on)
+    best = None
+    if plan["A"]:
+        best = "A"
+    if plan["B"] and plan["B"]["final"]:
+        a, b = plan["A"], plan["B"]
+        # ремонт — это ещё время, риск и работа: вариант 2 выбирается, только если он даёт заметно больше (не меньше половины цели)
+        gain = None if not a else (b["profit"] - a["profit"] if price else b["limit"] - a["limit"])
+        if not a or gain >= max(a["target"] / 2, 10):
+            best = "B"
+    elif plan["B"] and not plan["A"]:
+        best = "B"
+    plan["best"] = best
+    return plan
 
 
 NO_DATA = "Пока недостаточно данных для решения"
 
 
-def decide(facts, ap):
+SCEN_NAMES = {"A": "вариант 1 (перепродажа без ремонта)", "B": "вариант 2 (ремонт и перепродажа)"}
+
+
+def _decide_core(facts, ap):
     """Итоговый вывод: (код, текст). Код: buy / bargain / skip / unknown; текст всегда начинается с одной из четырёх фраз:
-    «Покупать по текущей цене», «Покупать только после торга…», «Не покупать для перепродажи», «Пока недостаточно данных для решения»."""
+    «Покупать по текущей цене», «Покупать только после торга…», «Не покупать для перепродажи», «Пока недостаточно данных для решения».
+    Решает не просто «прибыль > 0»: нужна целевая прибыль при консервативной продаже, а при низкой уверенности оценки —
+    ещё и запас (цена не выше «желаемой»)."""
     price, st = facts["price"], ap["status"]
     crit = [n for c, n in facts["defects"].items() if SEVERITY.get(c, 0) >= 3]
     if crit:
@@ -1300,49 +1726,146 @@ def decide(facts, ap):
         return "unknown", f"{NO_DATA} — аналоги пока не загружены."
     if st == "se_gen":
         return "unknown", f"{NO_DATA} — у iPhone SE не указано поколение, а цены поколений сильно разные."
-    c = ap.get("calc")
-    if st != "ok" or not c:
-        found, kept = ap.get("found", 0), ap.get("kept")
-        if kept is not None and found >= REF_MIN:
-            return "unknown", (f"{NO_DATA} — найдено {ads_nom(found)}, но цены сильно расходятся: после отсева аномальных "
-                               f"осталось {kept}, нужно хотя бы {REF_MIN}.")
-        return "unknown", f"{NO_DATA} — найдено только {ads_nom(found)} этой модели, для ориентира нужно хотя бы {REF_MIN}."
-    if ap.get("thin"):
-        return "unknown", (f"{NO_DATA} — аналогов мало ({ap['stats']['n']}, нужно ≥ {MIN_COMPS}): ориентиры очень приблизительные.")
+    plan = ap.get("plan") or {}
+    best = plan.get("best")
+    if st != "ok" or not (best or plan.get("upper")):
+        if st != "ok":
+            found, kept = ap.get("found", 0), ap.get("kept")
+            if kept is not None and found >= REF_MIN:
+                return "unknown", (f"{NO_DATA} — найдено {ads_nom(found)}, но цены сильно расходятся: после отсева аномальных "
+                                   f"осталось {kept}, нужно хотя бы {REF_MIN}.")
+            return "unknown", f"{NO_DATA} — найдено только {ads_nom(found)} этой модели, для ориентира нужно хотя бы {REF_MIN}."
+        return "unknown", f"{NO_DATA} — {no_estimate_reason(facts, ap)}"
+    if not best:  # состояние оценить не из чего: известна только верхняя граница (цена исправных)
+        up = plan["upper"]
+        if price and price > up["limit"]:
+            return "skip", (f"Не покупать для перепродажи — даже если продать как исправный (≈ {money(up['quick'])} BYN), максимум покупки "
+                            f"{money(up['limit'])} BYN, а просят {money(price)} BYN.")
+        return "unknown", f"{NO_DATA} — {no_estimate_reason(facts, ap)} Выше {money(up['limit'])} BYN платить в любом случае нельзя."
+    c, scen = plan[best], SCEN_NAMES[best]
     if not price:
-        return "unknown", f"{NO_DATA} — в объявлении нет цены: спроси её у продавца."
-    limit, unknown = c["limit"], c["repair_unknown"]
-    names = ", ".join(unknown)
+        return "unknown", f"{NO_DATA} — в объявлении нет цены: спроси её у продавца (уровни цены покупки посчитаны ниже)."
+    if ap.get("thin"):
+        n = (ap.get("stats") or {}).get("n", 0)
+        return "unknown", f"{NO_DATA} — аналогов мало ({n}, нужно ≥ {MIN_COMPS}): ориентиры предварительные, {scen}."
+    limit, desired, walk = c["limit"], c["desired"], c["walk"]
     over = price - limit
     reach = BARGAIN_REACH_HINT if facts["bargain"] == "yes" else BARGAIN_REACH
-    if unknown and over < 0:  # без неизвестного ремонта цена укладывается в лимит: всё зависит от цены ремонта
-        return "unknown", (f"{NO_DATA} — не известна цена ремонта ({names}). Если ремонт обойдётся не дороже {money(-over)} BYN, "
-                           f"цена {money(price)} BYN подходит (тогда покупать по текущей цене); если дороже — только после торга или отказ.")
-    if not unknown and over <= 0:
-        med = ap["stats"]["med"]
-        if max_severity(facts["defects"]) < 2 and price < 0.5 * med:  # слишком хорошо, чтобы быть правдой: «покупать» не говорим
-            return "unknown", (f"{NO_DATA} — цена {money(price)} BYN вдвое ниже рынка (медиана {money(med)} BYN): сначала убедись, что нет "
-                               f"блокировки iCloud и обмана; по расчёту лимит покупки {money(limit)} BYN.")
-        return "buy", f"Покупать по текущей цене — {money(price)} BYN не выше лимита {money(limit)} BYN (запас {money(-over)} BYN)."
     if limit <= 0:
         return "skip", (f"Не покупать для перепродажи — при ожидаемой продаже {money(c['quick'])} BYN расходы и целевая прибыль "
                         "не окупаются ни при какой цене.")
+    if not c["final"]:  # ремонт нужен, а его цена не известна: считаем, сколько на него можно потратить
+        names = ", ".join(c["rep_unknown"])
+        if over > 0:
+            if facts["bargain"] == "no":
+                return "skip", f"Не покупать для перепродажи — {money(price)} BYN выше максимума {money(limit)} BYN (ещё до ремонта), а продавец пишет «без торга»."
+            if over <= reach * price:
+                return "bargain", (f"Покупать только после торга до {money(limit)} BYN минус ремонт ({names}) — {scen}: цена ремонта не известна, "
+                                   f"максимум предварительный; сейчас {money(price)} BYN, уже без ремонта выше на {money(over)} BYN.")
+            return "skip", (f"Не покупать для перепродажи — даже при бесплатном ремонте максимум покупки {money(limit)} BYN, "
+                            f"а просят {money(price)} BYN (на {over / price * 100:.0f}% выше), торгом столько обычно не снять.")
+        room = floor5((limit - price) / (1 + REPAIR_OVERRUN_PCT / 100))
+        return "unknown", (f"{NO_DATA} — не известна цена ремонта ({names}). При цене {money(price)} BYN ремонт должен уложиться "
+                           f"в ≈ {money(room)} BYN (с запасом на удорожание), иначе цена не подходит; задай цену в REPAIR_COSTS.")
+    weak = ap.get("conf") == "низкая" or bool(ap.get("asis") and ap["asis"]["src"] == "interp")
+    prof = f"прибыль ≈ {signed(c['profit'])} BYN при быстрой продаже" if price else ""
+    if over <= 0:
+        clean_st = (ap.get("clean") or {}).get("st")
+        if max_severity(facts["defects"]) < 2 and clean_st and price < 0.5 * clean_st["med"]:  # слишком хорошо, чтобы быть правдой
+            return "unknown", (f"{NO_DATA} — цена {money(price)} BYN вдвое ниже рынка (медиана {money(clean_st['med'])} BYN): сначала "
+                               f"убедись, что нет блокировки iCloud и обмана; по расчёту максимум покупки {money(limit)} BYN.")
+        if price <= desired or not weak:
+            return "buy", (f"Покупать по текущей цене — {scen}: {money(price)} BYN не выше максимума {money(limit)} BYN "
+                           f"(запас {money(-over)} BYN), {prof}.")
+        return "bargain", (f"Покупать только после торга до {money(desired)} BYN — {scen}: цена {money(price)} BYN укладывается в максимум "
+                           f"{money(limit)} BYN, но оценка ненадёжна, поэтому нужен запас прочности.")
     if facts["bargain"] == "no":
-        return "skip", f"Не покупать для перепродажи — {money(price)} BYN выше лимита {money(limit)} BYN, а продавец пишет «без торга»."
+        return "skip", f"Не покупать для перепродажи — {money(price)} BYN выше максимума {money(limit)} BYN, а продавец пишет «без торга»."
+    if price > walk:
+        return "skip", (f"Не покупать для перепродажи — {money(price)} BYN выше цены отказа {money(walk)} BYN: даже при продаже "
+                        "по цене выставления сделка не окупается.")
     if over <= reach * price:
-        if unknown:
-            return "bargain", (f"Покупать только после торга до {money(limit)} BYN минус ремонт ({names}) — цена ремонта не известна, "
-                               f"лимит предварительный; сейчас {money(price)} BYN, уже без ремонта запаса нет.")
-        return "bargain", f"Покупать только после торга до {money(limit)} BYN — сейчас {money(price)} BYN, на {money(over)} BYN выше лимита."
-    return "skip", (f"Не покупать для перепродажи — {money(price)} BYN выше лимита {money(limit)} BYN на {money(over)} BYN "
+        return "bargain", (f"Покупать только после торга до {money(limit)} BYN — {scen}: сейчас {money(price)} BYN, "
+                           f"на {money(over)} BYN выше максимума." + (f" Оценка ненадёжна — лучше сбить до {money(desired)} BYN." if weak else ""))
+    return "skip", (f"Не покупать для перепродажи — {money(price)} BYN выше максимума {money(limit)} BYN на {money(over)} BYN "
                     f"({over / price * 100:.0f}% цены), торгом столько обычно не снять.")
+
+
+def decide(facts, ap):
+    """Итоговый вывод (код, текст) + пояснение про второй вариант: если решение «торг/отказ», показываем максимум по обоим вариантам,
+    а если ремонт не задан, но при низкой цене ремонта вариант 2 мог бы сработать — говорим, при какой цене ремонта."""
+    code, text = _decide_core(facts, ap)
+    try:
+        plan, price = ap.get("plan") or {}, facts["price"]
+        a, b = plan.get("A"), plan.get("B")
+        if price and a and b and code in ("skip", "bargain"):
+            if b["final"]:
+                text += f" Максимум покупки: вариант 1 — {money(a['limit'])} BYN, вариант 2 — {money(b['limit'])} BYN."
+            elif price <= b["limit"]:
+                room = floor5((b["limit"] - price) / (1 + REPAIR_OVERRUN_PCT / 100))
+                text += (f" Вариант 2 сработает, только если ремонт ({', '.join(b['rep_unknown'])}) обойдётся не дороже ≈ {money(room)} BYN — "
+                         "цена ремонта не задана.")
+    except Exception as e:  # пояснение вторично: основной вывод не теряем
+        log("Ошибка пояснения к выводу:", e)
+    return code, text
+
+
+def no_estimate_reason(facts, ap):
+    """Конкретно, чего не хватает, чтобы оценить телефон в его состоянии."""
+    cat = ad_cat(facts) or "unk"
+    snap = ap.get("snap") or {"rows": {}}
+    names = ", ".join(defect_kind_names(facts)) if cat != "unk" else "состояние"
+    row = snap["rows"].get(cat)
+    n = row["n"] if row else 0
+    return (f"нет аналогов в категории «{CAT_NAMES[cat]}» ({names}): найдено {n}, нужно ≥ {SNAP_NEED}, а соседних категорий "
+            "для расчёта между ними тоже не хватает.")
+
+
+def _source_conf(res, facts, plan, clean, pool, st, snap, sev):
+    """Основа оценки основного варианта -> (статистика, пул, минимум аналогов, уверенность, причины низкой уверенности)."""
+    asis, best = plan["asis"], plan["best"]
+    tier, need = "none", MIN_COMPS
+    if best == "B" or (asis and asis["src"] == "clean"):
+        sst, spool, tier = clean["st"], clean["pool"]["items"], clean["pool"]["tier"]
+    elif asis and asis["src"] == "same":
+        sst, spool, tier, need = st, pool["items"], pool["tier"], pool["need"]
+    elif asis and asis["src"] in ("cat", "ok"):
+        row = snap["rows"][asis["cat"]]
+        sst, spool, tier, need = row["st"], row["items"], "T4" if row["mixed"] else "T2", SNAP_NEED
+    else:
+        sst, spool = None, []
+    why = []
+    thin = bool(sst and sst["n"] < need)
+    if not sst:
+        conf = "низкая"
+        why.append("расчёт между категориями — это допущение, а не цена из объявлений" if asis else "аналогов нет")
+    else:
+        conf = confidence_of(sst["n"], tier, sst, res.get("stale"), bool(facts["mem"]), sev)
+        if thin:
+            why.append(f"мало аналогов: {sst['n']}")
+        if asis and asis["src"] == "cat":
+            why.append("аналоги той же категории, но дефекты могут отличаться")
+            conf = "средняя" if conf == "высокая" else conf
+        unconfirmed = (best == "B" or (asis and asis["src"] == "clean")) and res.get("basis") == "general" and res.get("like_n") is not None
+        if unconfirmed:  # у телефона есть дефект, а оценка идёт по общему рынку: состояние аналогов не подтверждено
+            why.append("состояние и дефекты аналогов не подтверждены")
+        if thin or unconfirmed:
+            conf = "низкая"
+    if not facts["mem"]:
+        why.append("память не указана")
+    if res.get("stale"):
+        why.append("аналоги не обновлялись давно")
+    if best == "B" and plan["B"] and not plan["B"]["final"]:
+        why.append("цена ремонта не известна")
+        conf = "низкая"
+    return sst, spool, need, thin, conf, why
 
 
 def _appraise(ad, facts, now=None):
     """Оценка по реальным аналогам. Не бросает исключений наружу: при сбое статус error."""
     res = {"status": "ok", "label": facts["label"], "price": facts["price"], "notes": [], "warnings": [], "verdict": None,
            "comps": [], "calc": None, "basis": None, "found": 0, "like_n": None, "like_need": None, "like_kind": None,
-           "conf": None, "conf_why": [], "thin": False, "like_for_like": False}
+           "conf": None, "conf_why": [], "thin": False, "like_for_like": False, "plan": None, "snap": None, "clean": None, "asis": None}
     try:
         if not market_query(facts["label"]):
             res["status"] = "no_model"
@@ -1367,52 +1890,48 @@ def _appraise(ad, facts, now=None):
         res.update(info, basis=basis, found=len(pool["items"]), tier=pool["tier"], desc=pool["desc"], place=pool["place"],
                    kind=pool["kind"], notes=list(pool["notes"]), need=pool["need"], priv=pool["priv"])
         res["comps"] = sorted(pool["items"], key=lambda it: it[1])[:3]
-        if not st or st["n"] < REF_MIN:
-            res["status"] = "few"  # аналогов меньше REF_MIN (или после отсева аномальных цен осталось меньше): ориентир считать не из чего
+        # эталон «исправный телефон»: аналоги без названных дефектов; нужен и для варианта «с ремонтом», и для расчёта между категориями
+        cpool = pool if basis == "general" else select_pool(items, facts, ad_id, region=reg, force_clean=True)
+        cst = st if basis == "general" else (price_stats([it[1] for it in cpool["items"]]) if len(cpool["items"]) >= REF_MIN else None)
+        clean = {"pool": cpool, "st": cst if cst and cst["n"] >= REF_MIN else None}
+        snap = market_snapshot(items, facts, ad_id)
+        like = {"pool": pool, "st": st} if basis == "defect" else None
+        plan = build_plan(ad, facts, snap, clean, like)
+        res.update(plan=plan, snap=snap, clean=clean, asis=plan["asis"])
+        if not plan["A"] and not plan["B"] and not clean["st"]:
+            res["status"] = "few"  # ориентир считать не из чего: ни по такому состоянию, ни по исправным
             if st:
                 res["kept"] = st["n"]
             return res
-        res["stats"] = st
-        res["thin"] = st["n"] < (MIN_COMPS if basis == "general" else pool["need"])
-        conf = confidence_of(st["n"], pool["tier"], st, stale, bool(facts["mem"]), sev)
-        why_low = []
-        if res["thin"]:
-            why_low.append(f"мало аналогов: {st['n']}")
-        if basis == "general" and info["like_n"] is not None:
-            why_low.append("состояние и дефекты аналогов не подтверждены")
-        if not facts["mem"]:
-            why_low.append("память не указана")
-        if stale:
-            why_low.append("аналоги не обновлялись давно")
-        if (res["thin"] or (basis == "general" and info["like_n"] is not None)) and conf != "низкая":
-            conf = "низкая"
-        res["conf"], res["conf_why"] = conf, why_low
-        like = basis == "defect" or info["like_n"] is None  # сравниваем с такими же, а не с телефонами без пометок о дефектах
-        res["like_for_like"] = like
-        if like:
-            res["target"] = (rnd5(st["p10"]), rnd5(st["q1"]))  # дешёвый, но реальный край рынка: от 10-го перцентиля до нижнего квартиля
+        sst, spool, need, thin, conf, why_low = _source_conf(res, facts, plan, clean, pool, st, snap, sev)
+        res["stats"] = sst or clean["st"]
+        res["thin"], res["conf"], res["conf_why"] = thin, conf, why_low
+        if thin:
+            res["notes"].append("аналогов мало — оценка приблизительная")
         if basis == "general" and info["like_n"] is None and facts["battery_pct"] is not None:
             res["notes"].append("состояние аккумулятора у аналогов неизвестно, на цену не влияет")
-        small = st["n"] < MIN_COMPS
-        if small:
-            res["notes"].append("аналогов мало — оценка приблизительная")
+        ref = plan["asis"] if plan["asis"] and plan["asis"]["found"] else None
+        res["like_for_like"] = bool(ref)  # сравниваем с такими же по состоянию, а не с телефонами без пометок о дефектах
         if not price:
             res["warnings"].append("цена не указана — вердикт невозможен")
-        else:
-            verdict, disc = rank_verdict(price, st)
+        elif ref:
+            verdict, disc = rank_verdict(price, ref["st"])
             res["pct"] = -disc * 100  # минус — дешевле медианы
-            if (small or conf == "низкая") and verdict == "ОЧЕНЬ ВЫГОДНО":
+            if (thin or conf == "низкая") and verdict == "ОЧЕНЬ ВЫГОДНО":
                 verdict = "ВЫГОДНО"  # на малой выборке «очень выгодно» не объявляем
             if sev >= 3 and verdict in ("ОЧЕНЬ ВЫГОДНО", "ВЫГОДНО"):
                 verdict = None
                 res["warnings"].append("низкая цена объясняется критичным дефектом — риск высокий")
-            elif sev < 2 and price < 0.5 * st["med"]:
+            elif sev < 2 and clean["st"] and price < 0.5 * clean["st"]["med"]:
                 res["warnings"].append("цена вдвое ниже рынка: проверь блокировку/обман")
                 if verdict == "ОЧЕНЬ ВЫГОДНО":
                     verdict = "ВЫГОДНО"
-            res["verdict"] = verdict if like else None  # оценку «выгодно/дорого» даём только в сравнении с такими же
-        res["comps"] = pick_comps(pool["items"], st, price)
-        res["calc"] = resale_calc(res, facts)
+            res["verdict"] = verdict
+        elif clean["st"]:
+            res["pct"] = (price - clean["st"]["med"]) / clean["st"]["med"] * 100
+        if spool and sst:
+            res["comps"] = pick_comps(spool, sst, price)
+        res["calc"] = plan[plan["best"]] if plan["best"] else None
     except Exception as e:
         log("Ошибка оценки цены:", e)
         res["status"] = "error"
@@ -1569,21 +2088,27 @@ def missing_text(facts, ap):
     """Конкретно, чего не хватает для точной оценки (вместо общей фразы «недостаточно данных»)."""
     if ap.get("status") != "ok":
         return ""
-    if ap.get("basis") == "general" and ap.get("like_n") is not None:
+    plan = ap.get("plan") or {}
+    asis = plan.get("asis")
+    uses_clean = bool(plan.get("B")) or bool(asis and asis["src"] == "clean")  # продажа считается по общему рынку (без названных дефектов)
+    if ap.get("basis") == "general" and ap.get("like_n") is not None and uses_clean:
         others = [n for n in defect_kind_names(facts) if n != KIND_NAMES["battery"]]
         if "battery" in facts["defects"]:
             what = "состояние аккумулятора и наличие дефектов" + (f" ({', '.join(others)})" if others else "")
         else:
             what = f"наличие дефектов ({', '.join(others)})"
-        return (f"Найдено {ads_nom(ap['found'])} похожих устройств, но {what} у них не подтверждены. "
-                "Поэтому оценка основана на общем рынке и может быть неточной.")
+        base = f"Найдено {ads_nom(ap['found'])} похожих устройств, но {what} у них не подтверждены. "
+        if asis and asis["src"] != "clean":  # вариант 1 оценён по другим аналогам, а на общем рынке стоит только цена после ремонта
+            return base + "Поэтому цена продажи после ремонта (вариант 2) основана на общем рынке и может быть неточной."
+        return base + "Поэтому оценка основана на общем рынке и может быть неточной."
     if ap.get("thin"):
         return f"Найдено только {ads_nom(ap['found'])}: для надёжной оценки нужно ≥ {MIN_COMPS}."
     return ""
 
 
 def market_lines(facts, ap):
-    st, price = ap["status"], facts["price"]
+    """📊 для статусов, когда таблицу категорий построить нельзя (нет модели, нет аналогов, мало аналогов, поколение SE)."""
+    st = ap["status"]
     if st == "no_model":
         return ["📊 Модель не определена — сравнить не с чем."]
     if st == "error":
@@ -1612,223 +2137,440 @@ def market_lines(facts, ap):
             out.append("   Найденные цены (очень низкая уверенность: слишком мало объявлений, это не оценка рынка): "
                        + ", ".join(money(it[1]) for it in ap["comps"]) + " BYN")
         return out
-    sta, v = ap["stats"], ap["verdict"]
-    if v:
-        head = f"📊 Цена относительно рынка: {VERDICT_ICON.get(v, '⚪')} <b>{v}</b>"
-        if price and ap.get("pct") is not None:
-            head += f" — {pct_text(ap['pct'])}"
-    elif price and ap.get("pct") is not None:
-        head = f"📊 Цена относительно рынка: {pct_text(ap['pct'])} общего рынка (сравнение с телефонами без подтверждённого дефекта, не с такими же)"
-    else:
-        head = "📊 Рынок:"
-    dropped = f"; в расчёт взято {sta['n']}, {sta['dropped']} с аномальной ценой отброшено" if sta["dropped"] else ""
-    out = [head, f"   Аналоги: найдено {ads_nom(ap['found'])} ({html.escape(pool_text(ap))}){dropped}. "
-                 f"Диапазон {money(sta['min'])}–{money(sta['max'])} BYN — это цены объявлений, а не сделок."]
-    ll, mt = like_line(facts, ap), missing_text(facts, ap)
-    if ll:
-        out.append("   " + html.escape(ll))
-    if mt:
-        out.append("   ⚠ " + html.escape(mt))
-    why = [w for w in ap.get("conf_why", []) if not (mt and w.startswith("состояние и дефекты"))]
-    out.append(f"   Надёжность оценки: {ap['conf']}" + (f" ({html.escape('; '.join(why))})" if why and ap["conf"] == "низкая" else ""))
-    for n in ap["notes"] + ap["warnings"]:
-        out.append(f"   ⚠ {html.escape(n)}")
-    if ap.get("stale") and ap.get("age_h") is not None:
-        out.append(f"   ⚠ аналоги обновлялись {ap['age_h']:.0f} ч назад (свежие загрузить не удалось)")
-    return out
-
-
-def target_line(facts, ap):
-    t, price = ap.get("target"), facts["price"]
-    if not t or ap["status"] != "ok":
-        return None
-    rng = f"{money(t[0])}–{money(t[1])}" if t[0] != t[1] else money(t[1])
-    src = "аналогов с таким же дефектом" if ap.get("basis") == "defect" else "активных аналогов"
-    line = f"🎯 Разумная цена для себя (не для перепродажи): <b>{rng} BYN</b> — дешёвая четверть {src}"
-    if price:
-        if price < t[0]:
-            line += "; цена продавца ниже этого диапазона"
-        elif price <= t[1]:
-            line += "; цена продавца в этом диапазоне"
-        else:
-            line += f"; продавец просит на {money(price - t[1])} BYN больше верхней границы"
-    return line
-
-
-def bargain_line(facts, ap):
-    price, t, b = facts["price"], ap.get("target"), facts["bargain"]
-    if not price:
-        txt = "цена не указана или договорная — спроси у продавца цену"
-        if t:
-            txt += f"; по рынку разумно {money(t[0])}–{money(t[1])} BYN"
-        return "🤝 " + txt
-    if b == "no":
-        return "🤝 Продавец пишет «без торга» — рассчитывай на указанную цену."
-    txt = "В тексте есть про торг — цена в объявлении, скорее всего, стартовая" if b == "yes" else "Про торг в тексте не сказано"
-    txt += ", уступит ли и сколько — неизвестно"
-    c = ap.get("calc")
-    if c and c["final"] and 0 < c["limit"] < price:
-        txt += f"; цель — не выше {money(c['limit'])} BYN (лимит для перепродажи)"  # лимит перепродажи строже «разумной цены для себя»
-    elif t and ap["status"] == "ok" and price > t[1] and not (c and c["final"]):
-        txt += f"; начни с ~{money(t[0])}, цель — не выше {money(t[1])} BYN"
-    return "🤝 " + txt + "."
+    return []
 
 
 def signed(x):
-    return f"{x:+,.0f}".replace(",", " ")
+    return f"{x:+,.0f}".replace(",", " ").replace("-", "−")
 
 
-def src_text(ap, n):
-    """На чём основана цена: «34 объявлений без пометок о дефектах в заголовке»."""
-    if ap["basis"] == "defect":
-        return f"{ads_gen(n)} " + ("«на запчасти»" if ap.get("like_kind") == "на запчасти" else "с таким же дефектом в заголовке")
-    return f"{ads_gen(n)} без пометок о дефектах в заголовке"
+def rng(a, b):
+    """«40–60» или «40», если границы совпадают."""
+    return money(a) if round(a) == round(b) else f"{money(a)}–{money(b)}"
 
 
-def formula_lines(facts, ap):
-    """Лимит покупки с расчётом: ремонт считается один раз, неизвестный ремонт показан в формуле, лимит помечен как предварительный."""
-    c, e = ap["calc"], html.escape
-    unk, parts = c["repair_unknown"], c["repair_parts"]
-    if parts and not unk:
-        rep = f"{money(c['repair'])} (ремонт: {e(', '.join(n for n, _v in parts))})"
-    elif parts:
-        rep = (f"{money(c['repair'])} (известная часть ремонта: {e(', '.join(n for n, _v in parts))}) − ещё ремонт "
-               f"({e(', '.join(unk))}; цена не известна)")
-    elif unk:
-        rep = f"ремонт ({e(', '.join(unk))}; цена не известна)"
-    elif ap["basis"] == "defect":
-        rep = "0 (дефект уже учтён в цене аналогов — ремонт не вычитается)"
-    else:
-        rep = "0 (ремонт не нужен)"
-    extra = f"{money(c['extra'])} (прочие расходы{'' if c['extra'] else ' не заданы'})"
-    calc = (f"{money(c['quick'])} (быстрая продажа) − {rep} − {extra} − {money(c['target_profit'])} (целевая прибыль) "
-            f"= {money(c['raw'])}")
-    out = ["   • Макс. цена покупки = ожидаемая продажа − ремонт − прочие расходы − целевая прибыль:"]
-    if unk:
-        out.append(f"     {calc} − {'ещё ' if parts else ''}ремонт")
-        out.append(f"     Лимит предварительный: не дороже <b>{money(c['limit'])} BYN</b> минус ремонт ({e(', '.join(unk))}) — "
-                   "его цена пока не известна.")
-    else:
-        round_note = " (округлено вниз до 5)" if abs(c["raw"] - c["limit"]) >= 1 else ""
-        out.append(f"     {calc} → не дороже <b>{money(c['limit'])} BYN</b>{round_note}")
+PHOTO_WHY = {
+    "off": "отключён (PHOTOS_MAX=0)",
+    "no_llm": "не подключена нейросеть (нет GEMINI_API_KEY / ANTHROPIC_API_KEY)",
+    "no_photos": "в объявлении нет фото",
+    "no_download": "фото не удалось загрузить с Куфара",
+    "error": "нейросеть не приняла запрос с фото",
+    "none": "анализ не запускался",
+}
+
+
+def kit_effect(ap):
+    """Влияние коробки на цену ПО АНАЛОГАМ: (разница медиан или None, аналогов с коробкой в заголовке, без неё).
+    Берётся только если в обеих группах не меньше SNAP_NEED объявлений; никаких «надбавок за предмет»."""
+    pool = ((ap.get("clean") or {}).get("pool") or {}).get("items") or []
+    with_box = [it[1] for it in pool if it[3] & F_BOX]
+    without = [it[1] for it in pool if not it[3] & F_BOX]
+    if len(with_box) >= SNAP_NEED and len(without) >= SNAP_NEED:
+        return statistics.median(with_box) - statistics.median(without), len(with_box), len(without)
+    return None, len(with_box), len(without)
+
+
+def kind_effect(ap, kind):
+    """На сколько аналоги с таким дефектом (по тексту) дешевле исправных: (разница медиан или None, число аналогов).
+    Для царапин и сколов («cosmetic») берётся категория «небольшие дефекты»."""
+    snap, clean = ap.get("snap"), ap.get("clean")
+    if not snap or not clean or not clean["st"] or (kind not in F_KINDS and kind != "cosmetic"):
+        return None, 0
+    row = snap["rows"]["minor"] if kind == "cosmetic" else kind_row(snap, kind)
+    if row["st"] and row["n"] >= SNAP_NEED:
+        return row["st"]["med"] - clean["st"]["med"], row["n"]
+    return None, row["n"]
+
+
+def photo_lines(facts, ap, compact=False):
+    """Что видно на фото. Только видимое: исправность функций по фото не определяется."""
+    e, ph = html.escape, facts.get("photo") or {}
+    st = ph.get("status", "none")
+    if st != "analyzed":
+        return [f"   • По фото: не анализировались — {PHOTO_WHY.get(st, PHOTO_WHY['none'])}."]
+    n, total = ph.get("n", 0), ph.get("total", 0)
+    finds = ph.get("findings") or []
+    poor = (ph.get("quality") or "").lower() == "плохое"
+    if not finds:
+        return [f"   • По фото ({n} из {total}): видимых дефектов не найдено" +
+                (" — но качество фото плохое, вывод ненадёжен" if poor else "; это не проверка работы телефона") + "."]
+    out = [f"   • По фото ({n} из {total}) видно" + (" (качество фото плохое, выводы ненадёжны)" if poor else "") + ":"]
+    for f in finds[: 2 if compact else 4]:
+        eff = ""
+        if f.get("kind") in F_KINDS or f.get("kind") == "cosmetic":
+            d, k = kind_effect(ap, f["kind"])
+            eff = (f" Аналоги с таким дефектом дешевле исправных на ≈ {money(-d)} BYN (по {k})." if d is not None and d < 0
+                   else f" Влияние на цену по аналогам не оценить (нужно ≥ {SNAP_NEED}, найдено {k}).")
+        chk = f" Проверить: {e(f['check'])}." if f.get("check") and not compact else ""
+        out.append(f"      – {e(f['what'])} (уверенность: {e(f['conf'])}).{eff}{chk}")
+    if ph.get("mismatch"):
+        out.append(f"      ⚠ Расхождение с описанием: {e(ph['mismatch'])}")
     return out
 
 
-def price_lines(facts, ap):
-    """Откуда взята каждая цена: в объявлении, цена выставления, быстрая продажа, максимум для покупки."""
-    c = ap.get("calc")
-    if ap.get("status") != "ok" or not c:
-        return []
-    e, price, n_in = html.escape, facts["price"], ap["stats"]["n"]
-    crit = [n for cd, n in facts["defects"].items() if SEVERITY.get(cd, 0) >= 3]
-    if crit:  # блокировка/вода/плата/запчасти: лимит покупки считать нельзя, справочные цифры показываем
-        return [f"💵 Для справки (уверенность: низкая): аналоги ({src_text(ap, n_in)}) выставляют ≈ {money(c['list'])} BYN, "
-                f"быстро продают ≈ {money(c['quick'])} BYN. Для телефона с дефектом «{e(', '.join(crit))}» эти цифры не годятся — "
-                "лимит покупки не считаю."]
-    out = [f"💵 Откуда цены (уверенность: {ap['conf']}):"]
-    if price:
-        rel = f", {pct_text(ap['pct'])} аналогов" if ap.get("pct") is not None else ""
-        out.append(f"   • В объявлении: {money(price)} BYN — цена продавца{rel}.")
+def kit_lines(facts, ap, compact=False):
+    e, ph = html.escape, facts.get("photo") or {}
+    seen = [x for x in facts["kit"] if x != "только телефон"]
+    seen_ph = [x for x in (ph.get("kit") or []) if x not in seen]
+    if not seen and not seen_ph:
+        return ["   • Комплект: " + ("продавец пишет «только телефон»." if "только телефон" in facts["kit"] else "в объявлении не указан.")]
+    parts = []
+    if seen:
+        parts.append("по тексту — " + e(", ".join(seen)))
+    if seen_ph:
+        parts.append("на фото видно — " + e(", ".join(seen_ph)))
+    out = ["   • Комплект: " + "; ".join(parts) + ". Оригинальность аксессуаров не подтверждена."]
+    if not compact and facts.get("box"):
+        d, nb, nw = kit_effect(ap)
+        out.append(f"      Коробка ≈ {signed(d)} BYN к медиане аналогов ({nb} с коробкой в заголовке и {nw} без; в расчёт не включено)."
+                   if d is not None else
+                   f"      Влияние коробки на цену не оценить: аналогов с коробкой {nb}, без неё {nw} (нужно ≥ {SNAP_NEED} в каждой группе).")
+    return out
+
+
+def state_lines(ad, facts, ap, compact=False):
+    """🔍 Состояние: категория, дефекты по тексту, аккумулятор, фото, комплект, что не проверено."""
+    e = html.escape
+    cat = ad_cat(facts) or "unk"
+    out = ["🔍 <b>Состояние</b>"]
+    defects = [n for _c, n in sorted(facts["defects"].items(), key=lambda kv: -SEVERITY.get(kv[0], 0))]
+    if defects:
+        out.append(f"   • Категория: {CAT_NAMES[cat]}. Дефекты (описание и фото): {e('; '.join(defects))}.")
+    elif cat == "ok":
+        out.append("   • Категория: исправные — продавец пишет, что всё в порядке; это слова продавца, не проверка.")
     else:
-        out.append("   • В объявлении: цена не указана.")
-    out.append(f"   • Выставлять ≈ {money(c['list'])} BYN — медиана цен {src_text(ap, n_in)}; это цены объявлений, не сделок.")
-    out.append(f"   • Быстро продать ≈ {money(c['quick'])} BYN — нижняя четверть цен тех же объявлений: консервативный ориентир, "
-               "сделками не подтверждён.")
-    out += formula_lines(facts, ap)
-    if price and c["repair_unknown"]:
-        out.append(f"   • Прибыль до учёта ремонта при цене {money(price)} BYN: ≈ {signed(c['profit_quick'])} BYN при быстрой продаже, "
-                   f"≈ {signed(c['profit_list'])} BYN по цене выставления; из этого нужно вычесть ремонт.")
-        if c["reserve"] > 0:
-            out.append(f"   • Запас на ремонт: до {money(c['reserve'])} BYN — при такой цене ремонта ещё останется целевая прибыль "
-                       f"{money(c['target_profit'])} BYN.")
-        else:
-            out.append("   • Запаса на ремонт нет: целевая прибыль не получается уже без ремонта.")
-    elif price:
-        costs = []
-        if c["repair"]:
-            costs.append(f"ремонт {money(c['repair'])} BYN")
-        costs.append(f"прочие расходы {money(c['extra'])} BYN" if c["extra"] else "прочие расходы не заданы")
-        out.append(f"   • Прибыль при цене {money(price)} BYN: ≈ {signed(c['profit_quick'])} BYN при быстрой продаже, "
-                   f"≈ {signed(c['profit_list'])} BYN по цене выставления ({', '.join(costs)}). Не гарантия.")
+        out.append("   • Дефекты в описании не названы — но это не значит, что телефон исправен: состояние не подтверждено.")
+    title = ad.get("subject") or ""
+    lock, bio = lock_status(facts, title), bio_status(facts, title)
+    known = ([f"блокировка — {lock}"] if lock else []) + ([f"Face/Touch ID — {bio}"] if bio else [])
+    if known:
+        out.append("   • Со слов продавца: " + e("; ".join(known)) + " (это слова, а не проверка).")
+    if facts["price"] and facts["bargain"] == "no":
+        out.append("   • Торг: продавец пишет «без торга» — рассчитывай на указанную цену.")
+    elif facts["price"] and facts["bargain"] == "yes":
+        out.append("   • Торг: в тексте есть про торг — цена, скорее всего, стартовая; сколько уступит, неизвестно.")
+    if not facts["desc"]:
+        out.append("   • Описание в выдаче Куфара не получено — оценка по названию и параметрам, открой объявление.")
+    bat = facts["battery_pct"]
+    if bat is not None:
+        out.append(f"   • Аккумулятор: {bat}%" + (" — ниже 80%, износ заметный, нужно оценить замену." if bat < 80 else "."))
+    out += photo_lines(facts, ap, compact)
+    out += kit_lines(facts, ap, compact)
+    unconf = (ap.get("plan") or {}).get("unconfirmed")
+    if unconf is None:
+        unconf = unconfirmed_checks(facts, ad.get("subject") or "")
+    if unconf:
+        out.append("   • Не проверено: " + e("; ".join(unconf)) + ".")
+    return out
+
+
+def cat_row_text(r):
+    """Строка категории: «5 шт. · медиана 275 (240–300)» или честное «мало»."""
+    st = r["st"]
+    if not r["all"]:
+        return "объявлений нет"
+    if not st or r["n"] < SNAP_NEED:
+        prices = ", ".join(money(p) for p in (st["prices"] if st else [])[:3])
+        return f"{r['n']} шт. ({prices} BYN) — мало для медианы"
+    bits = f"{r['n']} шт. · медиана {money(st['med'])} ({money(st['min'])}–{money(st['max'])})"
+    if r["mixed"]:
+        bits += " · память разная"
+    if r["shops"]:
+        bits += " · вкл. магазины"
+    return bits
+
+
+def market_block(facts, ap, compact=False):
+    """📊 Рынок по состоянию: цены активных объявлений той же модели по категориям — от исправных до неисправных."""
+    e, snap, me = html.escape, ap["snap"], ad_cat(facts) or "unk"
+    head = f"📊 <b>Рынок</b> — {e(ap['label'])}" + (f", {facts['mem']} ГБ" if facts["mem"] else "") + \
+           f": найдено {n_ads(snap['total'])}. Это цены объявлений, не сделок."
+    out = [head]
+    for c in CATS:
+        out.append(f"   • {CAT_NAMES[c]}: {cat_row_text(snap['rows'][c])}" + (" ◀ этот телефон" if c == me else ""))
+    ll, mt = like_line(facts, ap), missing_text(facts, ap)
+    if ll:
+        out.append("   " + e(ll))
+    if mt:
+        out.append("   ⚠ " + e(mt))
+    if ap.get("price") and ap.get("pct") is not None:
+        ref = "аналогов в том же состоянии" if ap.get("like_for_like") else "общего рынка (без названных дефектов; не сравнение с такими же)"
+        out.append(f"   Цена продавца {pct_text(ap['pct'])} {ref}." +
+                   (f" По рынку: <b>{ap['verdict']}</b> (для перепродажи решают расчёты ниже)." if ap.get("verdict") else ""))
+    if not compact:
+        for n in ap["notes"] + ap["warnings"]:
+            out.append(f"   ⚠ {e(n)}")
+        if snap.get("undefined"):
+            out.append(f"   ({snap['undefined']} объявлений из старого кеша без вида дефекта в расчёт категорий не вошли)")
+        if ap.get("stale") and ap.get("age_h") is not None:
+            out.append(f"   ⚠ аналоги обновлялись {ap['age_h']:.0f} ч назад (свежие загрузить не удалось)")
+    return out
+
+
+def asis_src_text(ap):
+    """Откуда цена «как есть»: найдено на рынке или расчёт (допущение)."""
+    a = ap["plan"]["asis"]
+    if a["src"] == "clean":
+        return f"найдено: {ads_nom(a['n'])} без названных дефектов, состояние не подтверждено"
+    if a["src"] == "ok":
+        return f"найдено: {ads_nom(a['n'])}, где исправность подтверждена словами продавца («идеал», «всё работает»)"
+    if a["src"] == "same":
+        what = "«на запчасти»" if ap.get("like_kind") == "на запчасти" else "с таким же дефектом в тексте"
+        return f"найдено: {ads_nom(a['n'])} {what}"
+    if a["src"] == "cat":
+        return f"найдено: {ads_nom(a['n'])} категории «{CAT_NAMES[a['cat']]}», дефекты могут отличаться"
+    lo, hi = a["between"]
+    names = {0: "без названных дефектов"}
+    names.update({CAT_LEVEL[c]: CAT_NAMES[c] for c in ("minor", "visible", "faulty")})
+    return f"расчёт (допущение): между категориями «{names[lo]}» и «{names[hi]}» — аналогов в категории «{CAT_NAMES[a['cat']]}» не хватает"
+
+
+def levels_line(c):
+    return f"   • Цена покупки: желательно ≤ <b>{money(c['desired'])}</b> · максимум <b>{money(c['limit'])}</b> · отказ выше {money(c['walk'])} BYN"
+
+
+def calc_line(c, label, repair_txt=None, prelim=False):
+    """Формула максимальной цены покупки с числами: продажа − расходы − целевая прибыль (ремонт вычитается один раз)."""
+    parts = [f"{money(c['quick'])} ({label})"]
+    if repair_txt:
+        parts.append(f"− {repair_txt}")
+    if c["extra"]:
+        parts.append(f"− {money(c['extra'])} (прочие расходы)")
+    if c["reserve"]:
+        parts.append(f"− {money(c['reserve'])} (резерв {RISK_RESERVE_PCT:g}% на непроверенные функции)")
+    parts.append(f"− {money(c['target'])} (целевая прибыль)")
+    tail = f"= {money(c['raw'])}" + (" (до вычета ремонта)" if prelim else (f" → {money(c['limit'])}" if abs(c["raw"] - c["limit"]) >= 1 else ""))
+    return "   • Расчёт: " + " ".join(parts) + " " + tail
+
+
+def profit_line(c, price, prefix="Прибыль"):
+    if not price or "profit" not in c:
+        return None
+    roi = f", ROI ≈ {c['roi'] * 100:+.0f}% от вложенных {money(price + c['costs'])} BYN".replace("-", "−") if c.get("roi") is not None else ""
+    return (f"   • {prefix} при цене {money(price)} BYN: от {signed(c['profit'])} (быстрая продажа) до {signed(c['profit_opt'])} "
+            f"(по цене выставления) BYN{roi}. Не гарантия.")
+
+
+def variant1_lines(facts, ap, compact=False):
+    plan, price, e = ap["plan"], facts["price"], html.escape
+    out = ["💵 <b>Вариант 1 — перепродажа без ремонта</b>"]
+    A = plan["A"]
+    if not A:
+        out.append(f"   • Оценить продажу «как есть» не из чего: {e(no_estimate_reason(facts, ap))}")
+        up = plan.get("upper")
+        if up:
+            out.append(f"   • Верхняя граница (если бы телефон был исправным): быстро ≈ {money(up['quick'])} BYN → максимум покупки "
+                       f"{money(up['limit'])} BYN; для телефона с дефектом реальный максимум ниже.")
+        return out
+    out.append(f"   • Продажа в текущем состоянии: выставлять ≈ {money(A['list'])} BYN (медиана), быстро ≈ {money(A['quick'])} BYN "
+               f"(нижняя четверть) — {e(asis_src_text(ap))}.")
+    out.append(calc_line(A, "быстрая продажа"))
+    out.append(levels_line(A))
+    pl = profit_line(A, price)
+    if pl:
+        out.append(pl)
+    return out
+
+
+def repair_text(rp):
+    """«замена акб 40–60 BYN (REPAIR_COSTS)» — только то, что задано пользователем или названо продавцом."""
+    return "; ".join(f"{i['name']} {rng(i['lo'], i['hi'])} BYN ({i['src']})" for i in rp["items"])
+
+
+def variant2_lines(facts, ap, compact=False):
+    plan, price, e = ap["plan"], facts["price"], html.escape
+    out = ["🔧 <b>Вариант 2 — ремонт и перепродажа</b>"]
+    rp, B = plan["repair"], plan["B"]
+    if plan["crit"]:
+        out.append("   • Не рассматриваю: " + e(", ".join(plan["crit"])) + " — скрытые повреждения и цена ремонта непредсказуемы.")
+        return out
+    if not rp["needs"]:
+        out.append("   • Ремонт не нужен: заметных неисправностей в описании нет.")
+        return out
+    if not B:
+        out.append("   • Не посчитан: нет исправных аналогов для цены продажи после ремонта (нужно ≥ " + str(REF_MIN) + ").")
+        return out
+    rep_parts = []
+    if rp["items"]:
+        rep_parts.append(e(repair_text(rp)))
+    if rp["unknown"]:
+        rep_parts.append(e(", ".join(rp["unknown"])) + " — цена ремонта не задана (REPAIR_COSTS), бот её не придумывает")
+    out.append("   • Ремонт: " + "; ".join(rep_parts) + (f". Запас на удорожание {REPAIR_OVERRUN_PCT:g}% учтён" if rp["items"] else ""))
+    out.append(f"   • Продажа после ремонта: выставлять ≈ {money(B['list'])} BYN, быстро ≈ {money(B['quick'])} BYN "
+               f"(найдено: {ads_nom(B['clean_n'])} без названных дефектов; состояние аналогов не подтверждено)")
+    if B["final"]:
+        out.append(calc_line(B, "быстрая продажа", f"{money(B['rep_hi'] + B['overrun'])} (ремонт {money(B['rep_hi'])} + запас {REPAIR_OVERRUN_PCT:g}%)"))
+    else:
+        txt = f"ремонт ({e(', '.join(rp['unknown']))}; цена не известна)"
+        if rp["items"]:
+            txt = f"{money(B['rep_hi'] + B['overrun'])} (известная часть ремонта) − ещё " + txt
+        out.append(calc_line(B, "быстрая продажа", txt, prelim=True))
+    out.append(levels_line(B) + ("" if B["final"] else " (до вычета ремонта)"))
+    pl = profit_line(B, price, "Прибыль после всех учтённых расходов") if B["final"] else None
+    if pl:
+        out.append(pl)
+    elif price and not B["final"]:
+        out.append(f"   • Прибыль до вычета ремонта при цене {money(price)} BYN: от {signed(B['profit'])} до {signed(B['profit_opt'])} BYN — "
+                   "из этого нужно вычесть ремонт.")
+    be = plan.get("breakeven")
+    if be and not compact:
+        out.append(f"   • Ремонт выгоднее варианта 1, только если запчасти + работа не дороже ≈ {money(be)} BYN.")
+        if plan["sens"]:
+            out.append("   • Что если (не цены ремонта, а чувствительность): " + "; ".join(
+                f"ремонт {money(r)} → максимум {money(m)}" for r, m in plan["sens"]) + " BYN.")
+    return out
+
+
+def risk_lines(facts, ap, compact=False):
+    """⚠️ Риски: непроверенные функции и скрытые дефекты, уверенность оценки, ликвидность, риски от нейросети."""
+    e, plan = html.escape, ap.get("plan") or {}
+    out = ["⚠️ <b>Риски</b>"]
+    unconf = plan.get("unconfirmed") or []
+    best = plan.get(plan.get("best")) if plan.get("best") else None
+    if unconf:
+        res = f" В расчёт заложен резерв {money(best['reserve'])} BYN ({RISK_RESERVE_PCT:g}%)." if best and best.get("reserve") else ""
+        out.append("   • Возможны скрытые дефекты: " + e("; ".join(unconf)) + "." + res)
+    else:
+        out.append("   • Все ключевые функции подтверждены словами продавца — это не проверка, посмотри при осмотре.")
+    if ap.get("conf"):
+        why = ap.get("conf_why") or []
+        out.append(f"   • Уверенность оценки: {ap['conf']}" + (f" — {e('; '.join(why))}" if why and ap["conf"] == "низкая" else "") + ".")
+    snap = ap.get("snap")
+    if snap and not compact and ap.get("status") == "ok":
+        thin = " Рынок тонкий — быстро продать может не получиться." if snap["total"] < 8 else ""
+        out.append(f"   • Ликвидность: на Куфаре сейчас {n_ads(snap['total'])} этой модели; за сколько они продаются, Куфар не показывает.{thin}")
+    if plan.get("best") == "B" and plan.get("B") and not plan["B"]["final"]:
+        out.append("   • Цена ремонта не известна — вариант 2 предварительный.")
+    for r in facts["risks"][: 1 if compact else 3]:
+        out.append(f"   • {e(r)}")
     return out
 
 
 def verdict_lines(facts, ap):
-    """Один однозначный вывод в конце оценки."""
+    """Один однозначный вывод в конце оценки (+ «только после проверки», если важные функции не подтверждены)."""
     code, text = ap.get("decision") or decide(facts, ap)
     head, sep, tail = text.partition(" — ")
-    out = f"✅ <b>Вывод для перепродажи:</b> {DECISION_ICON.get(code, '⚪')} <b>{html.escape(head)}</b>" + (f" — {html.escape(tail)}" if sep else "")
+    out = f"✅ <b>Итоговая рекомендация:</b> {DECISION_ICON.get(code, '⚪')} <b>{html.escape(head)}</b>" + (f" — {html.escape(tail)}" if sep else "")
     if code in ("buy", "bargain") and ap.get("conf") == "низкая":
         out += " Уверенность оценки низкая — проверь состояние при встрече."
-    return [out]
+    lines = [out]
+    crit = [x for x in ((ap.get("plan") or {}).get("unconfirmed") or []) if x.startswith(("блокировка", "Face"))]
+    if code in ("buy", "bargain") and crit:
+        lines.append("   🔎 Покупать только после проверки при осмотре: " + html.escape("; ".join(crit)) + ".")
+    return lines
 
 
-def build_message(ad, facts, ap):
-    """Сообщение в Telegram (HTML, до ~3900 символов). Только известные факты; неизвестное — «не указано»."""
+def header_lines(ad, facts):
     e = html.escape
     title = ad.get("subject") or facts["label"]
     price, usd = facts["price"], price_usd(ad)
     ptxt = (f"{money(price)} BYN" + (f" (~${money(usd)})" if usd else "")) if price else \
         ("цена договорная" if facts["negotiable_price"] else "цена не указана")
     place = ", ".join(x for x in (facts["region"], facts["area"]) if x) or "регион не указан"
-    lines = [f"📱 <b>{e(title)}</b>", f"💰 {e(ptxt)}", f"📍 {e(place)} · {'🏪 магазин' if facts['seller'] == 'магазин' else '👤 частник'}"]
     spec = [facts["label"] if facts["label"] != "Другое" else "модель не определена"]
     spec.append(f"{facts['mem']} ГБ" if facts["mem"] else "память не указана")
     spec.append(COND_RU[facts["cond"]])
     if facts["battery_pct"]:
         spec.append(f"акб {facts['battery_pct']}%")
-    if facts["kit"]:
-        spec.append("комплект: " + ", ".join(facts["kit"][:3]))
-    lines.append("🔧 " + e(" · ".join(spec)))
-    lock, bio = lock_status(facts, title), bio_status(facts, title)
-    unknown = [n for n, ok in (("блокировка/iCloud", lock is not None), ("комплект", bool(facts["kit"])),
-                               ("акб", facts["battery_pct"] is not None)) if not ok]
-    if facts["label"].startswith("iPhone") and bio is None:
-        unknown.append("Face/Touch ID")
-    known = []
-    if lock:
-        known.append(f"блокировка: {lock}")
-    if bio:
-        known.append(f"Face/Touch ID: {bio}")
-    if known:
-        lines.append("🔐 " + e("; ".join(known)))
-    if unknown:
-        lines.append("ℹ️ Не указано: " + e(", ".join(unknown)))
-    if not facts["desc"]:
-        lines.append("ℹ️ Описание в выдаче Куфара не получено — оценка по названию и параметрам, открой объявление.")
-    defects = [n for _c, n in sorted(facts["defects"].items(), key=lambda kv: -SEVERITY.get(kv[0], 0))]
-    lines.append("⚠️ " + (e("Дефекты: " + "; ".join(defects)) if defects else "Дефекты в объявлении не указаны"))
-    for r in facts["risks"]:
-        lines.append(f"⚠️ {e(r)}")
-    lines.append("📝 " + e(facts["summary"] or template_summary(facts, ap)))
-    lines.append("")
-    lines += market_lines(facts, ap)
-    lines += price_lines(facts, ap)
-    for extra in (target_line(facts, ap), bargain_line(facts, ap)):
-        if extra:
-            lines.append(extra)
+    return [f"📱 <b>{e(title)}</b>", f"💰 Цена продавца: {e(ptxt)}",
+            f"📍 {e(place)} · {'🏪 магазин' if facts['seller'] == 'магазин' else '👤 частник'}", "🔧 " + e(" · ".join(spec))]
+
+
+def comp_title_text(ap):
+    """Заголовок блока примеров: откуда взяты показанные аналоги — это зависит от того, по чему считался основной вариант."""
+    plan = ap.get("plan") or {}
+    asis = plan.get("asis")
+    src = asis["src"] if asis else None
+    if plan and (plan.get("best") == "B" or src == "clean"):
+        return "Примеры аналогов без названных дефектов (активные объявления, не сделки):"
+    if src == "ok":
+        return "Примеры аналогов, где исправность подтверждена словами продавца (активные объявления, не сделки):"
+    if src == "same":
+        what = "«на запчасти»" if ap.get("like_kind") == "на запчасти" else "с таким же дефектом"
+        return f"Примеры аналогов {what} (активные объявления, не сделки):"
+    if src == "cat":
+        return f"Примеры аналогов категории «{CAT_NAMES[asis['cat']]}» (активные объявления, не сделки):"
+    if ap.get("basis") == "general" and ap.get("like_n") is not None:
+        return "Примеры аналогов без названных дефектов (активные объявления, не сделки):"
+    return "Сопоставимые активные объявления (не сделки):"
+
+
+def build_message(ad, facts, ap):
+    """Сообщение в Telegram (HTML, до ~3990 символов): 📱 💰 / 🔍 Состояние / 📊 Рынок / 💵 Вариант 1 / 🔧 Вариант 2 / ⚠️ Риски / ✅ Итог.
+    Только известные факты; неизвестное названо «не указано» / «не подтверждено». Если не помещается — сначала сокращаются
+    второстепенные строки, затем убираются примеры аналогов, и только потом режется середина (итог и ссылка остаются всегда)."""
+    e = html.escape
+    ok = ap.get("status") == "ok" and ap.get("plan")
     verdict = verdict_lines(facts, ap)
-    lines += verdict
     comps = ap.get("comps") or []
     tail = ["🔗 " + e(ad.get("ad_link", item_url(ad["ad_id"])))]
-    comp_title = ("Примеры аналогов без подтверждённого дефекта (активные объявления, не сделки):"
-                  if ap.get("basis") == "general" and ap.get("like_n") is not None else "Сопоставимые активные объявления (не сделки):")
+    comp_title = comp_title_text(ap)
     comp_block = (["", comp_title] + [comp_line(c) for c in comps]) if comps else []
-    text = "\n".join(lines + comp_block + [""] + tail)
-    if len(text) > 3900:
-        text = "\n".join(lines + [""] + tail)
+
+    def body(compact):
+        lines = header_lines(ad, facts)
+        if facts.get("summary") or not compact:
+            lines.append("📝 " + e(facts["summary"] or template_summary(facts, ap)))
+        lines.append("")
+        lines += state_lines(ad, facts, ap, compact) + [""]
+        if ok:
+            lines += market_block(facts, ap, compact) + [""]
+            lines += variant1_lines(facts, ap, compact) + [""]
+            lines += variant2_lines(facts, ap, compact) + [""]
+        else:
+            lines += market_lines(facts, ap) + [""]
+        lines += risk_lines(facts, ap, compact) + [""]
+        return lines + verdict
+
+    text = None
+    for compact, with_comps in ((False, True), (False, False), (True, False)):
+        lines = body(compact)
+        text = "\n".join(lines + (comp_block if with_comps else []) + [""] + tail)
+        if len(text) <= 3900:
+            return text
     if len(text) > 3990:  # всё ещё длинно: режем середину по границе строки, итоговый вывод и ссылка остаются
         rest = "\n".join(verdict + [""] + tail)
-        body = "\n".join(lines[:-len(verdict)])[:max(0, 3990 - len(rest) - 3)].rsplit("\n", 1)[0]
-        text = body + "\n…\n" + rest
+        head = "\n".join(lines[:-len(verdict)])[:max(0, 3990 - len(rest) - 3)].rsplit("\n", 1)[0]
+        text = head + "\n…\n" + rest
     return text[:3990]
 
 
 # ---------- Основной цикл ----------
 
+SEEN_MAX = max(1, int(_env_float("SEEN_MAX", 10000)))  # сколько id объявлений помнить; вытесняются те, кого дольше всего не видели
+
+
+class Seen(set):
+    """Множество обработанных id, сохраняющее время последнего появления объявления в выдаче.
+
+    Раньше в seen.json хранились 5000 самых больших id. Старые объявления из узких запросов
+    выпадали из памяти и отправлялись повторно. Теперь вытесняются объявления, которые дольше всего не встречались.
+    """
+
+    def __init__(self, items=()):
+        super().__init__()
+        self.ts = {}  # id -> unix time последнего появления
+        for item in items:
+            self.add(item)
+
+    def add(self, ad_id, ts=None):
+        super().add(ad_id)
+        self.ts[ad_id] = int(ts or time.time())
+
+    def update(self, *others):
+        for other in others:
+            for ad_id in other:
+                self.add(ad_id)
+
+    def touch(self, ad_id):
+        """Объявление ещё есть в выдаче: не чаще раза в сутки обновляем время в памяти."""
+        now = int(time.time())
+        if ad_id in self and now - self.ts.get(ad_id, 0) > 86400:
+            self.ts[ad_id] = now
+
+
 def load_seen():
-    """seen.json: {"seen": [id...], "history": {...}, "market": {...}, "baseline": [...], "notice": N}.
-    Старый формат (только seen/history или просто список id) тоже читается. None = первый запуск."""
+    """Поддерживает новый формат seen={id: timestamp} и старые форматы списков id. None = первый запуск."""
     try:
         data = json.loads(SEEN_FILE.read_text())
     except Exception:
@@ -1838,7 +2580,21 @@ def load_seen():
     if not isinstance(data, dict):
         return None
     HISTORY.update(data.get("history") or {})
-    seen = set(data.get("seen") or [])
+    raw = data.get("seen") or []
+    now = int(time.time())
+    seen = Seen()
+    if isinstance(raw, dict):  # новый формат: {id: время последнего появления}
+        for key, timestamp in raw.items():
+            try:
+                seen.add(int(key), int(timestamp))
+            except (TypeError, ValueError):
+                pass
+    else:  # старый формат: считаем сохранённые id давно не встречавшимися
+        for key in raw:
+            try:
+                seen.add(int(key), now - 30 * 86400)
+            except (TypeError, ValueError):
+                pass
     market = data.get("market")
     STATE["market"] = market if isinstance(market, dict) else {}
     base = data.get("baseline")
@@ -1847,11 +2603,20 @@ def load_seen():
     STATE["notice"] = int(data.get("notice") or 0)
     pending = data.get("pending")
     STATE["pending"] = pending if isinstance(pending, dict) else {}
+    # При переходе со старого формата объявления из HISTORY тоже считаем уже обработанными,
+    # кроме объявлений, которые явно ожидают повторной отправки.
+    if not isinstance(raw, dict):
+        for key, rec in HISTORY.items():
+            if str(key).isdigit() and str(key) not in STATE["pending"] and isinstance(rec, dict):
+                try:
+                    seen.add(int(key), now)
+                except (TypeError, ValueError):
+                    pass
     return seen
 
 
 def save_seen(seen):
-    """Сохраняет состояние атомарно (временный файл + замена), чтобы оборванный запуск не испортил seen.json."""
+    """Атомарно сохраняет состояние и вытесняет id, которых дольше всего не видели."""
     if DRY_RUN:
         return
     cutoff = time.time() - 35 * 86400  # историю старше 5 недель не храним
@@ -1859,7 +2624,9 @@ def save_seen(seen):
         del HISTORY[k]
     week = time.time() - 7 * 86400
     market = {k: v for k, v in STATE["market"].items() if isinstance(v, dict) and v.get("t", 0) > week}
-    data = {"seen": sorted(seen)[-5000:], "history": HISTORY, "market": market,
+    # Держим не больше SEEN_MAX id; первыми вытесняются те, кого дольше всего не видели.
+    newest = sorted(seen.ts.items(), key=lambda kv: kv[1])[-SEEN_MAX:]
+    data = {"seen": {str(ad_id): timestamp for ad_id, timestamp in sorted(newest)}, "history": HISTORY, "market": market,
             "baseline": sorted(set(STATE["baseline"])), "notice": STATE["notice"], "pending": STATE["pending"]}
     tmp = SEEN_FILE.with_name(SEEN_FILE.name + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
@@ -1874,6 +2641,8 @@ def stash(ad_id, ad):
     даже если оно уже уйдёт из выдачи Куфара."""
     slim = {k: ad[k] for k in _KEEP if k in ad}
     slim["ad_parameters"] = [{"p": x.get("p"), "vl": x.get("vl")} for x in (ad.get("ad_parameters") or []) if isinstance(x, dict)]
+    slim["images"] = [{"path": im["path"], "yams_storage": bool(im.get("yams_storage")), "media_storage": im.get("media_storage")}
+                      for im in (ad.get("images") or [])[:max(PHOTOS_MAX, 1)] if isinstance(im, dict) and im.get("path")]  # чтобы повтор не потерял фото
     STATE["pending"][str(ad_id)] = {"t": STATE["pending"].get(str(ad_id), {}).get("t") or int(time.time()), "ad": slim}
 
 
@@ -1908,7 +2677,7 @@ def pick_extra(now=None):
 
 def is_suspicious(facts, ap):
     """Цена вдвое ниже рынка без заметных дефектов — похоже на развод; в цены для недельного отчёта не берём."""
-    st = ap.get("stats")
+    st = (ap.get("clean") or {}).get("st") or ap.get("stats")
     return bool(st and facts["price"] and facts["price"] < 0.5 * st["med"] and max_severity(facts["defects"]) < 2)
 
 
@@ -1963,7 +2732,7 @@ def process_ad(ad):
 def cycle(seen, first_run):
     """Один проход. Возвращает (сколько запросов прошло, сколько запускали)."""
     t0 = time.time()
-    RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0)
+    RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0, img_fails=0)
     _MARKET_REFRESHES["n"] = 0
     queries = list(QUERIES) + pick_extra(t0)
     base = set() if first_run else set(STATE["baseline"])
@@ -1975,6 +2744,8 @@ def cycle(seen, first_run):
             log(f"Ошибка Куфара ({q}):", e)
             continue
         ok_queries += 1
+        for a in ads:
+            seen.touch(a["ad_id"])  # объявление ещё в выдаче: продлеваем память, чтобы оно не вернулось как «новое»
         if q in base:
             new_ads.update({ad["ad_id"]: ad for ad in ads if ad["ad_id"] not in seen})
         else:  # запрос запускается впервые: то, что уже висит, запоминаем молча, чтобы не завалить чат старым
@@ -1983,10 +2754,10 @@ def cycle(seen, first_run):
         time.sleep(KUFAR_PAUSE)
     quiet = {i: a for i, a in quiet.items() if i not in seen and i not in new_ads}
     if quiet:
-        seen.update(quiet)
         for ad in quiet.values():
             try:
                 if basic_filter(ad):
+                    seen.add(ad["ad_id"])
                     record_ad(ad, True)
             except Exception as e:
                 log("Пропускаю странное объявление:", ad.get("ad_id"), e)
@@ -2009,8 +2780,7 @@ def cycle(seen, first_run):
                     pass
             break
         try:
-            if not basic_filter(ad):
-                seen.add(ad_id)
+            if not basic_filter(ad):  # не телефон (чехол, планшет и т.п.): не запоминаем, повторная проверка стоит дёшево
                 unstash(ad_id)
                 continue
             text, ok = process_ad(ad)
@@ -2043,7 +2813,7 @@ def dry_run():
     Показывает до DRY_LIMIT подходящих объявлений из выдачи (вне зависимости от того, видел ли их бот раньше)."""
     load_seen()  # кеш аналогов из seen.json, только чтение
     t0 = time.time()
-    RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0)
+    RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0, img_fails=0)
     _MARKET_REFRESHES["n"] = 0
     log(f"ТЕСТОВЫЙ ЗАПУСК: покажу до {DRY_LIMIT} подходящих объявлений. В Telegram ничего не уходит, seen.json не меняется.")
     shown, ok_queries = set(), 0
@@ -2098,7 +2868,7 @@ def main():
 
     seen = load_seen()
     first_run = seen is None
-    seen = seen or set()
+    seen = seen or Seen()
 
     if "--once" in sys.argv:
         # Один проход и выход — для запуска по расписанию (GitHub Actions)
