@@ -975,11 +975,20 @@ def parse_memory(text):
 
 
 def parse_battery(text):
-    t = (text or "").lower()
-    m = re.search(r"(?:акб|аккумулятор\w*|батаре\w*|емкость|ёмкость|battery|здоровье)\D{0,18}?(\d{2,3})\s*%", t) or \
-        re.search(r"(\d{2,3})\s*%\s*(?:акб|аккумулятор\w*|батаре\w*|емкост\w*|ёмкост\w*|battery)", t)
-    if m and 40 <= int(m.group(1)) <= 100:
-        return int(m.group(1))
+    """Процент АКБ берём только из явной конструкции вроде «акб 100%» или «100% battery».
+    Не ищем произвольное число через 18 символов: так можно принять посторонний процент за здоровье батареи."""
+    t = " ".join((text or "").lower().replace("ё", "е").split())
+    battery_term = r"(?:акб|аккумулятор\w*|батаре\w*|battery(?:\s+health)?|здоровье\s+батареи|(?:емкость|ёмкость)\s+(?:аккумулятора|батареи|акб)|емкост\w*)"
+    patterns = (
+        rf"{battery_term}\s*[:=\-]?\s*(\d{{2,3}})\s*%",
+        rf"(\d{{2,3}})\s*%\s*{battery_term}",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, t)
+        if m:
+            value = int(m.group(1))
+            if 40 <= value <= 100:
+                return value
     return None
 
 
@@ -1200,107 +1209,71 @@ PHOTO_RULES = (
 
 
 def llm_analyze(ad, facts):
-    """Нейросеть читает объявление (и его фото, если они скачались) и возвращает структурированные факты — ОДНИМ запросом:
-    текст и фото уходят вместе. Без ключа, при ошибке или когда нейросеть отключена — None. Состояние разбора фото записывается
-    в facts['photo']['status']. Удачный разбор запоминается (AI_CACHE): то же объявление второй раз не тратит запрос и не качает фото."""
+    """Нейросеть используется только для описания видимых деталей на реально загруженных фото.
+    Характеристики, цена, аккумулятор, состояние, комплект и риски из текста определяются правилами, не ответом LLM."""
     ph = facts["photo"]
     if not (GEMINI_KEY or ANTHROPIC_KEY):
         ph["status"] = "no_llm"
         return None
+    if PHOTOS_MAX <= 0:
+        ph["status"] = "off"
+        return None
+    refs = image_refs(ad)
+    if not refs:
+        ph["status"] = "no_photos"
+        return None
     info = (
-        f"Название: {ad.get('subject')}\n"
-        f"Цена: {facts['price']:.0f} BYN" + (" (0 = не указана/договорная)" if not facts["price"] else "") + "\n"
-        f"Параметры: состояние={param(ad, 'condition')}; модель={param(ad, 'phones_model')}; "
-        f"память={param(ad, 'phablet_phones_memory') or param(ad, 'phones_memory')}\n"
-        f"Регион: {facts['region']}, {facts['area']}\nПродавец: {facts['seller']}\n"
-        f"Модель по нашему определению: {facts['label']}\n"
-        f"Описание: {facts['desc'] or 'в данных нет (только название)'}"
+        f"Название объявления: {ad.get('subject') or 'не указано'}\n"
+        f"Цена из данных Куфара: {facts['price']:.0f} BYN" + (" (цена не указана/договорная)" if not facts["price"] else "") + "\n"
+        f"Описание продавца: {facts['desc'] or 'описание не получено'}\n"
+        "Эти текстовые сведения даны только для проверки возможного противоречия с фотографиями. "
+        "Не извлекай и не угадывай из них цену, модель, память, процент АКБ или работоспособность."
     )
-    key, sig = str(ad.get("ad_id")), _ai_sig(info, image_refs(ad)[:max(PHOTOS_MAX, 0)])
+    key, sig = str(ad.get("ad_id")), _ai_sig(info, refs[:PHOTOS_MAX])
     hit = AI_CACHE.get(key)
     if hit and hit["sig"] == sig:
         LLM_STATS["cached"] += 1
-        log("Нейросеть: разбор этого объявления уже есть в кеше, запрос не нужен:", key)
+        log("Нейросеть: визуальный разбор этого объявления уже есть в кеше:", key)
         ph.update(copy.deepcopy(hit["photo"]))
         return copy.deepcopy(hit["data"])
-    if _LLM["off"]:  # статус фото — про причину, по которой фото не разобраны: нет фото / PHOTOS_MAX=0 / нейросеть недоступна
-        has_photos = PHOTOS_MAX > 0 and bool(image_refs(ad))
-        ph["status"] = "llm_off" if has_photos else ("off" if PHOTOS_MAX <= 0 else "no_photos")
+    if _LLM["off"]:
+        ph["status"] = "llm_off"
         return None
 
-    def done(data, photo, cache=True):
-        ph.update(photo)
-        if cache and isinstance(data, dict):
-            _ai_store(key, sig, data, photo)
-        return data
-
     images, why = fetch_photos(ad)
-    head = "Ты помогаешь покупать и перепродавать телефоны на Куфаре (Беларусь). Разбери объявление.\n\n" + info + "\n\n"
-    schema = (
-        "Ответь ТОЛЬКО JSON такого вида (все тексты по-русски, коротко):\n"
-        '{"is_phone": true, "memory_gb": null, "condition": "новый|б/у|восстановленный|неисправный|на запчасти|не указано", '
-        '"defects": [{"type": "' + "|".join(_DEFECT_TYPES) + '", "note": "что именно"}], '
-        '"screen": "не указано", "body": "не указано", "battery_pct": null, "face_touch_id": "работает|не работает|не указано", '
-        '"lock": "нет|есть|не указано", "kit": [], "bargain": "торг|без торга|не указано", "repair_cost_byn": null, '
-        '"summary": "1-2 коротких предложения: что продаётся и на что смотреть", "risks": ["до 3 коротких рисков"]@@PHOTOS@@}\n'
-    )
-    rules = (
-        "Правила: is_phone=false, только если продаётся НЕ целый телефон (чехол, стекло, коробка, запчасти для телефона, услуга, «куплю»); "
-        "телефон «на запчасти» — это is_phone=true с дефектом parts. НЕ ВЫДУМЫВАЙ: чего нет в тексте — null или «не указано». "
-        "repair_cost_byn заполняй только если продавец прямо назвал стоимость ремонта в BYN. Дефект записывай, только если он назван "
-        "в объявлении; «без царапин», «icloud чистый» дефектами не считаются."
-    )
-    text_prompt = head + schema.replace("@@PHOTOS@@", "") + rules
     if not images:
-        return done(llm_json(text_prompt, 700), {"status": why or "none"}, cache=(why != "no_download"))
-    data = llm_json(head + schema.replace("@@PHOTOS@@", PHOTO_SCHEMA) + rules + PHOTO_RULES, 1100, images=images)
+        ph["status"] = why or "no_download"
+        return None
+
+    prompt = (
+        "Ты анализируешь ТОЛЬКО фотографии объявления б/у телефона. Не оценивай стоимость и не определяй модель или характеристики.\n\n"
+        + info + "\n\n"
+        'Ответь ТОЛЬКО JSON вида {"photos": {"findings": [{"part":"экран|задняя крышка|рамка/корпус|камера|разъём|следы вскрытия|другое", '
+        '"kind":"screen|cosmetic|camera|opened|other", "what":"короткое описание только видимого", '
+        '"confidence":"высокая|средняя|низкая", "check":"что проверить при осмотре"}], '
+        '"kit_visible": [], "mismatch": "", "quality": "хорошее|среднее|плохое"}}.\n'
+        "Если дефект не очевиден, не утверждай, что он есть: укажи низкую уверенность или не включай его. "
+        "Не выводи аккумулятор, цену, память, Face ID, блокировки, камеры/звук как работающие или неработающие по фото. "
+        "В комплект добавляй только предметы, которые явно видны на фото. Если фото недостаточно информативны, укажи плохое качество.\n"
+        + PHOTO_RULES
+    )
+    data = llm_json(prompt, 700, images=images)
     if isinstance(data, dict) and isinstance(data.get("photos"), dict):
-        return done(data, {"status": "analyzed", "n": len(images)})
-    # Запрос с фото не прошёл или ответ без разбора фото. Второй запрос (только текст) — лишь если дело в самом запросе/ответе
-    # (HTTP 400, ответ не разобрался). Лимит (429), сбой сервиса (503) и обрыв связи вторым запросом не лечатся: он только расходует лимит.
-    bad_request = _LLM["last"] in (400, "parse")
-    if data is None and bad_request and not _LLM["off"]:
-        return done(llm_json(text_prompt, 700), {"status": "error"})
-    if isinstance(data, dict):
-        data.pop("photos", None)
-        return done(data, {"status": "error"})
-    return done(None, {"status": "error" if bad_request else "llm_off"})
+        photo = {"status": "analyzed", "n": len(images)}
+        ph.update(photo)
+        _ai_store(key, sig, data, photo)
+        return data
+    transient = _LLM.get("last") in _TEMP_CODES or _LLM.get("last") == "net"
+    ph["status"] = "llm_off" if _LLM["off"] or transient else "error"
+    return None
 
 
 def merge_llm(facts, data):
-    """Дополняет правила ответом нейросети. Дефекты складываются, неизвестное заполняется, правила не затираются."""
-    if not data:
+    """Из ответа нейросети принимаем только визуальные наблюдения. Текстовые характеристики не доверяем LLM."""
+    if not isinstance(data, dict):
         return facts
-    facts["llm"] = True
-    if data.get("is_phone") is False:
-        facts["is_phone"] = False
-    for d in data.get("defects") or []:
-        if isinstance(d, dict) and d.get("type") in _DEFECT_TYPES:
-            facts["defects"].setdefault(d["type"], str(d.get("note") or d["type"])[:60])
-    mem = data.get("memory_gb")
-    if not facts["mem"] and isinstance(mem, (int, float)) and int(mem) in (16, 32, 64, 128, 256, 512, 1024):
-        facts["mem"] = int(mem)
-    bat = data.get("battery_pct")
-    if facts["battery_pct"] is None and isinstance(bat, (int, float)) and 40 <= bat <= 100:
-        facts["battery_pct"] = int(bat)
-        if bat < 80:
-            facts["defects"].setdefault("battery", f"аккумулятор {int(bat)}%")
-    if facts["bargain"] is None:
-        facts["bargain"] = {"торг": "yes", "без торга": "no"}.get(str(data.get("bargain")).lower())
-    if facts["cond"] == "unknown":
-        facts["cond"] = {"новый": "new", "б/у": "used", "восстановленный": "refurb"}.get(str(data.get("condition")).lower(), "unknown")
-    rc = data.get("repair_cost_byn")
-    if isinstance(rc, (int, float)) and rc > 0:
-        facts["repair_cost"] = float(rc)
-    if not facts["kit"] and isinstance(data.get("kit"), list):
-        facts["kit"] = [str(x)[:25] for x in data["kit"][:4]]
-    facts["summary"] = str(data.get("summary") or "")[:260]
-    facts["risks"] = [str(x)[:80] for x in (data.get("risks") or [])[:3]]
-    facts["screen"] = str(data.get("screen") or "")[:80]
-    facts["body"] = str(data.get("body") or "")[:80]
-    facts["face_touch"] = str(data.get("face_touch_id") or "")[:20]
-    facts["lock_text"] = str(data.get("lock") or "")[:20]
     if facts["photo"].get("status") == "analyzed" and isinstance(data.get("photos"), dict):
+        facts["llm"] = True
         merge_photos(facts, data["photos"])
     return facts
 
@@ -1327,10 +1300,8 @@ def merge_photos(facts, ph):
     out["kit"] = [x for x in kit if x in PHOTO_KIT] if isinstance(kit, list) else []
     out["mismatch"] = str(ph.get("mismatch") or "")[:140]
     out["quality"] = str(ph.get("quality") or "")[:20]
-    if out["quality"].lower() != "плохое":
-        for f in finds:
-            if f["conf"] == "высокая" and f["kind"] in ("screen", "cosmetic", "camera"):
-                facts["defects"].setdefault(f["kind"], "по фото: " + f["what"])
+    # Фото-наблюдения показываем отдельно, но не превращаем автоматически в дефекты для расчёта цены.
+    # Так ошибочная визуальная догадка модели не меняет рекомендацию без подтверждения продавцом.
 
 
 def analyze_ad(ad):
@@ -2121,6 +2092,19 @@ def _source_conf(res, facts, plan, clean, pool, st, snap, sev):
             why.append("состояние и дефекты аналогов не подтверждены")
         if thin or unconfirmed:
             conf = "низкая"
+        # Не называем оценку высокой, когда целевая категория состояния почти пуста,
+        # а цена рассчитана по общим объявлениям без подтверждения исправности.
+        asis = plan.get("asis")
+        target_cat = ad_cat(facts) or "unk"
+        target_row = (snap or {}).get("rows", {}).get(target_cat) or {}
+        if asis and asis.get("src") == "clean" and target_row.get("n", 0) < SNAP_NEED:
+            why.append(f"в категории «{CAT_NAMES.get(target_cat, target_cat)}» мало аналогов; использован общий рынок")
+            if conf == "высокая":
+                conf = "средняя"
+    if ad_cat(facts) == "unk":
+        why.append("исправность не подтверждена словами продавца")
+        if conf == "высокая":
+            conf = "средняя"
     if not facts["mem"]:
         why.append("память не указана")
     if res.get("stale"):
@@ -2476,6 +2460,8 @@ def photo_lines(facts, ap, compact=False):
         out.append(f"      – {e(f['what'])} (уверенность: {e(f['conf'])}).{eff}{chk}")
     if ph.get("mismatch"):
         out.append(f"      ⚠ Расхождение с описанием: {e(ph['mismatch'])}")
+    if any(f.get("kind") in ("screen", "cosmetic", "camera") and f.get("conf") in ("высокая", "средняя") for f in finds):
+        out.append("      ℹ Визуальные наблюдения не меняют расчёт цены автоматически — подтверди дефект у продавца.")
     return out
 
 
@@ -2780,8 +2766,7 @@ def build_message(ad, facts, ap):
 
     def body(compact):
         lines = header_lines(ad, facts)
-        if facts.get("summary") or not compact:
-            lines.append("📝 " + e(facts["summary"] or template_summary(facts, ap)))
+        lines.append("📝 " + e(template_summary(facts, ap)))
         lines.append("")
         lines += state_lines(ad, facts, ap, compact) + [""]
         if ok:
@@ -2990,6 +2975,9 @@ def process_ad(ad):
                 ad["body"] = body
             time.sleep(KUFAR_PAUSE)
         facts = analyze_ad(ad)
+        raw_price = ad.get("price_byn")
+        if raw_price not in (None, "", 0, "0"):
+            log(f"Цена из выдачи Куфара: ad_id={ad.get('ad_id')}, price_byn_raw={raw_price!r}, распознано={facts['price']:.0f} BYN")
         if not facts["is_phone"]:
             return None, False
         ap = appraise(ad, facts)

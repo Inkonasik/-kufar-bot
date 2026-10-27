@@ -99,7 +99,7 @@ f = k.rule_facts(CASES["экранирование"])
 f["summary"] = "Продам <script>alert(1)</script> & всё"
 f["risks"] = ["<i>риск</i>"]
 m = k.build_message(CASES["экранирование"], f, k.appraise(CASES["экранирование"], f))
-check("экранирование сводки и рисков", "&lt;script&gt;" in m and "<script>" not in m and "&lt;i&gt;" in m and "<i>" not in m)
+check("AI-сводка не выводится; риски экранируются", "<script>" not in m and "&lt;i&gt;" in m and "<i>" not in m)
 for n, want in ((1, "1 активное объявление"), (2, "2 активных объявления"), (5, "5 активных объявлений"), (11, "11 активных объявлений"),
                 (21, "21 активное объявление"), (22, "22 активных объявления"), (112, "112 активных объявлений")):
     check(f"склонение {n}", k.n_ads(n) == want, k.n_ads(n))

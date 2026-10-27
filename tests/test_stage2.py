@@ -525,11 +525,11 @@ check("Gemini: ключ в заголовке, увеличенный тайма
 ph = fp["photo"]
 check("фото: статус analyzed, просмотрено 4 из 5", ph["status"] == "analyzed" and ph["n"] == 4 and ph["total"] == 5, ph)
 check("фото: находки разобраны, пустая и без текста отброшена, неизвестный вид -> other", [f["kind"] for f in ph["findings"]] == ["screen", "camera", "other"], ph["findings"])
-check("фото: в дефекты попал только экран (уверенность «высокая», вид screen/cosmetic/camera); «средняя» и чужой вид — нет",
-      fp["defects"].get("screen") == "по фото: трещина в углу экрана" and "camera" not in fp["defects"] and "battery" not in fp["defects"], fp["defects"])
+check("фото-наблюдения не превращаются автоматически в подтверждённые дефекты для расчёта",
+      "screen" not in fp["defects"] and "camera" not in fp["defects"] and "battery" not in fp["defects"], fp["defects"])
 check("фото: комплектация — только из списка допустимых (выдуманный «золотой кейс» убран)", ph["kit"] == ["коробка", "наушники"], ph["kit"])
 check("фото: расхождение с описанием сохранено", "на экране трещина" in ph["mismatch"], ph["mismatch"])
-check("фото: после «трещина на фото» категория стала «заметные дефекты» (слова продавца — «идеал»)", k.ad_cat(fp) == "visible", (k.ad_cat(fp), fp["defects"]))
+check("фото не меняет цену автоматически; текстовая категория остаётся из описания", k.ad_cat(fp) == "ok", (k.ad_cat(fp), fp["defects"]))
 xs_market()
 apf = k.appraise(phone_ad, fp)
 mf = k.build_message(phone_ad, fp, apf)
@@ -564,7 +564,7 @@ k.RUN.update(img_fails=0)
 fc = k.analyze_ad(phone_ad)
 mc = k.build_message(phone_ad, fc, k.appraise(phone_ad, fc))
 check("на фото дефектов нет: сказано «это не проверка работы телефона»", "видимых дефектов не найдено; это не проверка работы телефона" in mc, mc)
-# нейросеть не приняла запрос с фото -> статус error, текст всё равно разобран вторым запросом без картинок
+# нейросеть не приняла запрос с фото -> статус error; повторный текстовый запрос не расходуется
 posts.clear()
 reset_llm()
 k.requests.post = make_post(REPLY | {"summary": "Только текст."}, fail_with_images=True)
@@ -572,8 +572,8 @@ k.RUN.update(img_fails=0)
 fe = k.analyze_ad(phone_ad)
 me = k.build_message(phone_ad, fe, k.appraise(phone_ad, fe))
 second = posts[-1]["json"]["contents"][0]["parts"]
-check("запрос с фото не прошёл: статус error, второй запрос — только текст, объявление не потеряно",
-      fe["photo"]["status"] == "error" and len(posts) == 2 and all("inline_data" not in p for p in second) and fe["llm"] and "нейросеть не приняла запрос с фото" in me,
+check("запрос с фото не прошёл: статус error, второй запрос не делается, текстовые правила работают",
+      fe["photo"]["status"] == "error" and len(posts) == 1 and not fe["llm"] and "нейросеть не приняла запрос с фото" in me,
       (fe["photo"]["status"], len(posts), fe["llm"]))
 # нет ключа / нет фото / не скачались
 k.GEMINI_KEY = ""
@@ -583,14 +583,15 @@ check("нет ключа нейросети: «не анализировалис
 k.GEMINI_KEY = "fake-key"
 k.requests.post = make_post(REPLY)
 reset_llm()
+posts.clear()
 fnp2 = k.analyze_ad(ad("iPhone XS 64gb", 30000, "Продаю.", ad_id=9601))
-check("в объявлении нет фото: статус no_photos, разбор текста идёт (один запрос без картинок)", fnp2["photo"]["status"] == "no_photos" and fnp2["llm"], fnp2["photo"])
+check("в объявлении нет фото: нейросеть не вызывается; правила разбирают текст", fnp2["photo"]["status"] == "no_photos" and not fnp2["llm"] and not posts, (fnp2["photo"], posts))
 reset_llm()
 k.RUN.update(img_fails=0)
 posts.clear()
 fnd = k.analyze_ad(ad("iPhone XS 64gb", 30000, "Продаю.", ad_id=9602, images=[{"path": "adim1/bad9.jpg"}]))
-check("картинки не скачались: статус no_download, разбор текста всё равно идёт без картинок",
-      fnd["photo"]["status"] == "no_download" and fnd["llm"] and len(posts) == 1 and all("inline_data" not in p for p in posts[0]["json"]["contents"][0]["parts"]), (fnd["photo"], len(posts)))
+check("картинки не скачались: статус no_download, ненужный текстовый запрос не делается",
+      fnd["photo"]["status"] == "no_download" and not fnd["llm"] and len(posts) == 0, (fnd["photo"], len(posts)))
 # --- Claude (запасной путь): картинки как base64-блоки ---
 k.GEMINI_KEY, k.ANTHROPIC_KEY = "", "ak"
 reset_llm()

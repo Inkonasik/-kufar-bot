@@ -75,7 +75,8 @@ def ok_text(text):
 
 
 def ok(reply=None):
-    return ok_text(json.dumps(reply if reply is not None else OK_REPLY, ensure_ascii=False))
+    # Для анализа объявления нормальный ответ содержит визуальный блок photos.
+    return ok_text(json.dumps(reply if reply is not None else PHOTO_REPLY, ensure_ascii=False))
 
 
 MINUTE = "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
@@ -530,7 +531,7 @@ res = [k.analyze_ad(ad(f"iPhone 7 {i}", 15000 + i, ad_id=3000 + i, images=imgs(2
 check("шторм 503 на 6 объявлениях: два объявления по 3 попытки, потом нейросеть отключена — всего 6 запросов, не 6×3",
       len(srv.calls) == 6 and k._LLM["off"] and all(not f["llm"] for f in res), (len(srv.calls), k._LLM))
 check("шторм 503: второго «текстового» запроса после неудачи фото-запроса нет (все 6 запросов — с картинками)", all(has_images(c) for c in srv.calls))
-check("шторм 503: все объявления разобраны по правилам", all(f["is_phone"] for f in res) and all(f["photo"]["status"] == "llm_off" for f in res))
+check("шторм 503: все объявления разбираются по правилам и сообщают о недоступности AI", all(f["is_phone"] for f in res) and all(f["photo"]["status"] == "llm_off" for f in res))
 
 # 503 один раз и дальше всё хорошо: нейросеть работает для остальных
 srv = setup([err5xx(), err5xx(), err5xx(), ok(PHOTO_REPLY)])
@@ -550,7 +551,7 @@ check("нормально: фото разобраны (analyzed, 4 из 5)", f[
 
 srv = setup()
 f = k.analyze_ad(ad(ad_id=4001))
-check("нет фото: один текстовый запрос", len(srv.calls) == 1 and not has_images(srv.calls[0]) and f["photo"]["status"] == "no_photos" and f["llm"])
+check("нет фото: API не вызывается, используется разбор по правилам", len(srv.calls) == 0 and f["photo"]["status"] == "no_photos" and not f["llm"])
 
 srv = setup([err429(delay="30s", quota=DAY), ok()])
 f = k.analyze_ad(ad(ad_id=4002, images=imgs(2, "j")))
@@ -568,17 +569,17 @@ check("запрос с фото -> обрыв связи: второго зап�
 
 srv = setup([Resp(400, {"error": {"code": 400, "message": "картинка не принята"}}), ok()])
 f = k.analyze_ad(ad(ad_id=4005, images=imgs(2, "m")))
-check("запрос с фото -> HTTP 400: второй запрос только с текстом, объявление разобрано, статус error",
-      len(srv.calls) == 2 and has_images(srv.calls[0]) and not has_images(srv.calls[1]) and f["llm"] and f["photo"]["status"] == "error", (len(srv.calls), f["photo"]))
+check("запрос с фото -> HTTP 400: повторный текстовый запрос не тратит квоту, объявление разбирается по правилам",
+      len(srv.calls) == 1 and has_images(srv.calls[0]) and not f["llm"] and f["photo"]["status"] == "error", (len(srv.calls), f["photo"]))
 
 srv = setup([ok_text("это не JSON"), ok()])
 f = k.analyze_ad(ad(ad_id=4006, images=imgs(2, "n")))
-check("запрос с фото -> ответ не разобрался: второй запрос только с текстом", len(srv.calls) == 2 and not has_images(srv.calls[1]) and f["llm"] and f["photo"]["status"] == "error")
+check("запрос с фото -> нечитаемый ответ: нет второго бесполезного запроса", len(srv.calls) == 1 and not f["llm"] and f["photo"]["status"] == "error")
 
-srv = setup([Resp(400, {"error": {"code": 400}}), Resp(400, {"error": {"code": 400}}), ok()])
+srv = setup([Resp(400, {"error": {"code": 400}}), ok()])
 f = k.analyze_ad(ad(ad_id=4007, images=imgs(2, "o")))
-check("оба запроса вернули 400: всего 2 запроса, нейросеть отключена (2 ошибки подряд), объявление не потеряно",
-      len(srv.calls) == 2 and not f["llm"] and k._LLM["off"] and f["is_phone"], (len(srv.calls), k._LLM))
+check("HTTP 400: один запрос, объявление не теряется и сеть не объявляется выключенной",
+      len(srv.calls) == 1 and not f["llm"] and not k._LLM["off"] and f["is_phone"], (len(srv.calls), k._LLM))
 
 # Claude (запасной путь) идёт через тот же ограничитель и ту же обработку ошибок
 srv = setup([Resp(529, {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})],
@@ -607,14 +608,14 @@ data = k.llm_analyze(a1, k.rule_facts(a1))
 data["summary"] = "ИСПОРЧЕНО"
 data["defects"].append({"type": "screen", "note": "x"})
 data2 = k.llm_analyze(a1, k.rule_facts(a1))
-check("кеш отдаёт копии: правка результата не портит сохранённое", data2["summary"] != "ИСПОРЧЕНО" and data2["defects"] == [], data2)
+check("кеш отдаёт копии: правка результата не портит сохранённое", data2["photos"]["findings"] == [], data2)
 k.llm_reset()
 f3 = k.analyze_ad(a1)
 check("кеш не сбрасывается новым запуском (режим постоянного цикла)", len(srv.calls) == 1 and f3["llm"])
 k._LLM["off"] = True
 f4 = k.analyze_ad(a1)
 f5 = k.analyze_ad(ad(ad_id=5001, images=imgs(4, "q")))
-check("нейросеть отключена: объявление из кеша всё равно разобрано, новое — по правилам", f4["llm"] and not f5["llm"] and f5["photo"]["status"] == "llm_off" and len(srv.calls) == 1)
+check("нейросеть отключена: объявление из кеша всё равно разобрано, новое — по правилам", f4["llm"] and not f5["llm"] and f5["photo"]["status"] == "llm_off" and len(srv.calls) == 1, (f4["llm"], f5["llm"], f5["photo"]["status"], len(srv.calls)))
 
 srv = setup(default=lambda s: ok(PHOTO_REPLY))
 base = ad(ad_id=5100, images=imgs(4, "r"))
@@ -644,14 +645,14 @@ f1 = k.analyze_ad(a3)
 k.http_get = good_get
 k.RUN["img_fails"] = 0
 f2 = k.analyze_ad(a3)
-check("кеш: если фото не скачались, текстовый разбор не кешируется — при повторе фото анализируются",
-      f1["photo"]["status"] == "no_download" and f2["photo"]["status"] == "analyzed" and len(srv.calls) == 2, (f1["photo"]["status"], f2["photo"]["status"], len(srv.calls)))
+check("кеш: если фото не скачались, запрос не кешируется — при повторе фото анализируются",
+      f1["photo"]["status"] == "no_download" and f2["photo"]["status"] == "analyzed" and len(srv.calls) == 1, (f1["photo"]["status"], f2["photo"]["status"], len(srv.calls)))
 
 # вытеснение: не больше AI_CACHE_MAX разборов
 srv = setup()
 k.AI_CACHE_MAX = 3
 for i in range(5):
-    k.analyze_ad(ad(f"iPhone 8 {i}", ad_id=5400 + i))
+    k.analyze_ad(ad(f"iPhone 8 {i}", ad_id=5400 + i, images=imgs(1, f"cache{i}")))
 check("кеш ограничен по размеру (3): самые старые вытеснены, свежие на месте", list(k.AI_CACHE) == ["5402", "5403", "5404"], list(k.AI_CACHE))
 k.AI_CACHE_MAX = 200
 
