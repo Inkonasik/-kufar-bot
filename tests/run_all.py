@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TESTS = ["test_models", "test_facts", "test_appraise", "test_message", "test_llm", "test_report", "test_cycle", "fuzz"]
+TESTS = ["test_models", "test_facts", "test_appraise", "test_message", "test_stage2", "test_llm", "test_ratelimit", "test_report", "test_cycle", "fuzz"]
 failed = []
 for name in TESTS:
     p = subprocess.run([sys.executable, "-I", str(HERE / f"{name}.py")], capture_output=True, text=True)

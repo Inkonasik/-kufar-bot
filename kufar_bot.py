@@ -54,15 +54,26 @@ iPhone 12 и новее, Galaxy S10 и новее, планшеты, чехлы/
                      (если не задан — берётся регион самого объявления)
   RUN_BUDGET_S       сколько секунд отводится на один запуск --once (200)
   KUFAR_PAUSE        пауза между запросами к Куфару, сек (0.4)
+Ограничитель запросов к нейросети (значения по умолчанию безопасны для бесплатного лимита Gemini — 15 запросов в минуту):
+  GEMINI_RPM         не больше стольких запросов к нейросети за любые 60 секунд (10)
+  GEMINI_MIN_GAP_S   пауза между запросами к нейросети, сек: от конца предыдущего запроса до начала следующего (6)
+  GEMINI_RETRIES     сколько раз повторять запрос после 503/500/502/504 (2: паузы 5 и 10 с или Retry-After). После 429 — один повтор;
+                     второй 429 за запуск, суточная квота или просьба ждать дольше GEMINI_MAX_WAIT_S отключают нейросеть до конца запуска
+  GEMINI_MAX_WAIT_S  дольше этого одного ожидания ради повтора бот не ждёт, сек (60)
 """
 import base64
+import copy
+import hashlib
 import html
 import json
+import math
 import os
 import re
 import statistics
 import sys
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import requests
@@ -126,6 +137,15 @@ def _env_json(name):
         return {}
 
 
+def _env_range(name, default, lo, hi):
+    """Число из переменной окружения, зажатое в [lo, hi]. Мусор, пустая строка, nan и inf заменяются значением по умолчанию."""
+    try:
+        v = float(os.getenv(name, default))
+    except ValueError:
+        return float(default)
+    return float(min(hi, max(lo, v))) if math.isfinite(v) else float(default)
+
+
 MARKET_TTL_H = _env_float("MARKET_TTL_HOURS", 6)      # через сколько часов обновлять кеш аналогов
 MARKET_MAX_REFRESH = int(_env_float("MARKET_MAX_REFRESH", 6))  # сколько моделей обновлять за один запуск
 MARKET_SIZE = int(_env_float("MARKET_SIZE", 100))      # сколько объявлений-аналогов запрашивать по модели
@@ -143,6 +163,10 @@ RUN_BUDGET_S = _env_float("RUN_BUDGET_S", 200)         # сколько секу
 KUFAR_PAUSE = _env_float("KUFAR_PAUSE", 0.4)           # пауза между запросами к Куфару
 HTTP_BACKOFF = _env_float("HTTP_BACKOFF", 1.0)         # множитель пауз между повторами запросов (0 = без пауз, для тестов)
 SEND_PAUSE = _env_float("SEND_PAUSE", 0.7)             # пауза между сообщениями в Telegram
+GEMINI_RPM = int(_env_range("GEMINI_RPM", 10, 1, 1000))              # не больше стольких запросов к нейросети за любые 60 секунд
+GEMINI_MIN_GAP_S = _env_range("GEMINI_MIN_GAP_S", 6, 0, 60)          # пауза между запросами к нейросети (от конца предыдущего запроса)
+GEMINI_RETRIES = int(_env_range("GEMINI_RETRIES", 2, 0, 5))          # повторов после 503/500/502/504 (после 429 — один повтор)
+GEMINI_MAX_WAIT_S = _env_range("GEMINI_MAX_WAIT_S", 60, 0, 600)      # дольше одного такого ожидания не ждём: нейросеть отключается до конца запуска
 MAX_CARD_FETCH = int(_env_float("MAX_CARD_FETCH", 25))  # сколько карточек объявлений (описаний) запрашивать за запуск
 PENDING_TTL_H = _env_float("PENDING_TTL_HOURS", 24)    # сколько часов повторять неотправленное объявление
 DRY_RUN = "--dry-run" in sys.argv or os.getenv("DRY_RUN", "").strip().lower() in ("1", "true", "yes")  # тестовый запуск: без Telegram и без записи
@@ -272,6 +296,211 @@ def basic_filter(ad):
 
 
 # ---------- Нейросеть (необязательно) ----------
+# Все обращения к нейросети (разбор объявления, недельный отчёт) идут через _llm_call -> _llm_post. Там живут общий ограничитель
+# скорости (llm_gate) и отдельная обработка 429 и 503. Разбор одного объявления — ОДИН запрос: текст и фото уходят вместе.
+
+class LlmOff(RuntimeError):
+    """Нейросеть отключена до конца запуска (повторный 429, суточная квота, ошибки): запрос не отправлялся."""
+
+
+# fails — ошибок подряд; off — больше не обращаться до конца запуска; n429 — сколько ответов 429 пришло за запуск;
+# last — чем кончился последний запрос (код HTTP / "ok" / "parse" / "net" / "off"); why — почему нейросеть отключена
+_LLM = {"fails": 0, "off": False, "n429": 0, "last": None, "why": ""}
+LLM_STATS = {"requests": 0, "ok": 0, "r429": 0, "r5xx": 0, "retries": 0, "cached": 0, "waited": 0.0}  # для строки-итога в логе
+_GATE = {"stamps": [], "last": None}  # когда уходили запросы к нейросети; между проходами (в режиме цикла) НЕ сбрасывается
+_TEMP_CODES = (500, 502, 503, 504, 529)  # временные ошибки сервиса (529 — «перегружен» у Claude)
+_DEFAULT_429_WAIT = 30.0  # сколько ждать после 429, если сервис не сказал сколько
+
+
+def _mono():
+    return time.monotonic()
+
+
+def _nap(sec):
+    if sec > 0:
+        time.sleep(sec)
+
+
+def llm_reset():
+    """Новый запуск (проход): нейросеть снова включена, счётчики обнулены. Ограничитель скорости (_GATE) и кеш разборов НЕ сбрасываются:
+    в режиме постоянного цикла лимит «запросов в минуту» действует и между проходами."""
+    _LLM.clear()
+    _LLM.update(fails=0, off=False, n429=0, last=None, why="")
+    LLM_STATS.update(requests=0, ok=0, r429=0, r5xx=0, retries=0, cached=0, waited=0.0)
+
+
+def llm_disable(why, details=""):
+    """Больше ни одного запроса к нейросети до конца запуска: остальные объявления разбираются по правилам.
+    why — короткая причина (попадает и в итоговую строку лога), details — подробности для сообщения об отключении."""
+    if not _LLM["off"]:
+        _LLM["off"], _LLM["why"] = True, why
+        log(f"Нейросеть отключена до конца запуска: {why}. {details + '. ' if details else ''}"
+            "Остальные объявления разбираю по правилам, без нейросети.")
+
+
+def llm_log_summary(always=True):
+    """Одна строка в лог в конце запуска: сколько было запросов к нейросети, лимитов, повторов и обращений к кешу. По ней видно, работает ли ограничитель.
+    always=False (режим постоянного цикла) — молчим, если за проход с нейросетью ничего не происходило."""
+    if not (GEMINI_KEY or ANTHROPIC_KEY):
+        return
+    s = LLM_STATS
+    if not always and not (s["requests"] or s["cached"] or _LLM["off"]):
+        return
+    state = f"отключена до конца запуска ({_LLM['why']})" if _LLM["off"] else "работала весь запуск"
+    log(f"Нейросеть за запуск: запросов {s['requests']} (успешных {s['ok']}), ответов 429: {s['r429']}, "
+        f"ошибок 503 и подобных: {s['r5xx']}, повторов: {s['retries']}, из кеша: {s['cached']}, "
+        f"ждал из-за лимита: {s['waited']:.0f} с; {state}. Лимит: {GEMINI_RPM} запросов/мин, пауза не меньше {GEMINI_MIN_GAP_S:g} с.")
+
+
+def llm_gate():
+    """Общий ограничитель скорости. Ждёт, пока можно слать запрос, и занимает «слот». Условия: не меньше GEMINI_MIN_GAP_S секунд
+    после конца предыдущего запроса и не больше GEMINI_RPM запросов за любые 60 секунд. Возвращает, сколько секунд ждали."""
+    waited = 0.0
+    while True:
+        now = _mono()
+        stamps = [t for t in _GATE["stamps"] if now - t < 60.0]
+        _GATE["stamps"] = stamps
+        need = 0.0
+        if _GATE["last"] is not None and GEMINI_MIN_GAP_S > 0:
+            need = _GATE["last"] + GEMINI_MIN_GAP_S - now
+        if len(stamps) >= GEMINI_RPM:
+            need = max(need, stamps[-GEMINI_RPM] + 60.0 - now)  # ждём, пока из минутного окна уйдёт самый старый запрос
+        if need <= 1e-6 or waited >= 120:  # 120 с — страховка от зависания (часы подменены или сломаны): дольше двух минут не ждём
+            break
+        need += 0.05  # небольшой запас: проснуться раньше срока нельзя
+        if need >= 2:
+            log(f"Нейросеть: жду {need:.0f} с (лимит: не больше {GEMINI_RPM} запросов в минуту, "
+                f"пауза между запросами не меньше {GEMINI_MIN_GAP_S:g} с)")
+        _nap(need)
+        waited += need
+    _GATE["stamps"].append(now)
+    _GATE["last"] = now
+    LLM_STATS["waited"] += waited
+    return waited
+
+
+def _header(resp, name):
+    try:
+        for k, v in (getattr(resp, "headers", None) or {}).items():
+            if str(k).lower() == name.lower():
+                return v
+    except Exception:
+        pass
+    return None
+
+
+def _error_info(r):
+    """Что известно об ответе-ошибке: (суточная ли квота, сколько секунд просит подождать сервис или None, короткий текст ошибки,
+    названия исчерпанных квот). Секунды берутся из заголовка Retry-After (число или дата) и из тела ответа Gemini
+    (RetryInfo.retryDelay, «Please retry in 12s»); если указаны оба — большее. Суточная квота — по quotaId с «PerDay».
+    Формат ответов Google могут изменить: любые неожиданности разбираются молча (тогда считаем квоту минутной, а ожидание — по умолчанию)."""
+    hints, daily, msg, quotas = [], False, "", []
+    ra = _header(r, "Retry-After")
+    if ra is not None:
+        s = str(ra).strip()
+        try:
+            v = float(s)
+        except ValueError:
+            try:
+                dt = parsedate_to_datetime(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                v = max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())  # дата в прошлом (часы расходятся) = «можно сразу»
+            except (TypeError, ValueError, IndexError, OverflowError):
+                v = None
+        if v is not None and math.isfinite(v) and v >= 0:
+            hints.append(v)
+    try:
+        err = (r.json() or {}).get("error") or {}
+        full = str(err.get("message") or "")
+        msg = re.split(r"(?<=[.!?])\s", " ".join(full.split()), maxsplit=1)[0][:140]  # первая фраза: дальше идут ссылки и справка
+        for d in err.get("details") or []:
+            if not isinstance(d, dict):
+                continue
+            for viol in d.get("violations") or []:
+                qid = str(viol.get("quotaId") or "") if isinstance(viol, dict) else ""
+                if qid and qid not in quotas:
+                    quotas.append(qid)
+                if "perday" in re.sub(r"[\W_]+", "", qid).lower():
+                    daily = True
+            m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)s\s*", str(d.get("retryDelay") or ""))
+            if m:
+                hints.append(float(m.group(1)))
+        if not any(isinstance(d, dict) and d.get("retryDelay") for d in err.get("details") or []):
+            m = re.search(r"retry in (\d+(?:\.\d+)?)s", full, re.I)
+            if m:
+                hints.append(float(m.group(1)))
+        if re.search(r"\bper day\b|PerDay", full, re.I):
+            daily = True
+    except Exception:
+        pass
+    return daily, (max(hints) if hints else None), msg, ", ".join(quotas[:3])
+
+
+def _http_error(r, msg="", quota=""):
+    code = getattr(r, "status_code", "?")
+    text = f"{code} {msg}".strip() if msg else f"HTTP {code}"
+    return requests.HTTPError(text + (f" [квота: {quota}]" if quota else ""), response=r)
+
+
+def _budget_ok(wait):
+    """Успеем ли мы дождаться: запуск не должен вылезти за RUN_BUDGET_S."""
+    return not RUN["deadline"] or time.time() + wait <= RUN["deadline"]
+
+
+def _llm_post(url, **kw):
+    """POST к нейросети через общий ограничитель скорости; 429 и 5xx обрабатываются по-разному.
+    429: суточная квота — сразу отключаем нейросеть до конца запуска; второй 429 за запуск — тоже отключаем; первый — ждём
+    (Retry-After / RetryInfo, иначе 30 с) и повторяем ОДИН раз; просят ждать дольше GEMINI_MAX_WAIT_S или дольше, чем осталось
+    на запуск, — отключаем без повтора.
+    503/500/502/504: до GEMINI_RETRIES повторов с растущей паузой (5, 10 с или Retry-After); просят ждать слишком долго — без повтора.
+    Остальные ошибки (400, 401, 403…) и сетевые сбои не повторяются. Успех — ответ; неудача — исключение (HTTPError с .response,
+    сетевая ошибка или LlmOff, если нейросеть уже отключена)."""
+    retries = 0
+    while True:
+        if _LLM["off"]:
+            raise LlmOff(_LLM["why"] or "нейросеть отключена до конца запуска")
+        llm_gate()
+        LLM_STATS["requests"] += 1
+        try:
+            r = requests.post(url, **kw)
+        finally:
+            _GATE["last"] = _mono()  # пауза между запросами считается от конца предыдущего
+        code = getattr(r, "status_code", 200)
+        if not isinstance(code, int) or code < 400:
+            LLM_STATS["ok"] += 1
+            return r
+        daily, hint, msg, quota = _error_info(r)
+        if code == 429:
+            LLM_STATS["r429"] += 1
+            _LLM["n429"] += 1
+            q = f"квота {quota}" if quota else ""
+            if daily:
+                llm_disable("исчерпана суточная квота Gemini (429)",
+                            (f"Квота {quota}. " if quota else "") + "Она сбрасывается в полночь по тихоокеанскому времени (около 10–11 утра по Минску); "
+                            "снижение скорости запросов её не восстановит")
+            elif _LLM["n429"] >= 2:
+                llm_disable("повторный 429 за запуск", "Лимит запросов Gemini" + (f", {q}" if q else ""))
+            else:
+                wait = hint + 1 if hint is not None else _DEFAULT_429_WAIT * HTTP_BACKOFF
+                if (hint if hint is not None else wait) > GEMINI_MAX_WAIT_S or not _budget_ok(wait):
+                    llm_disable(f"Gemini просит подождать {wait:.0f} с (429)", "Дольше, чем можно ждать в этом запуске" + (f"; {q}" if q else ""))
+                else:
+                    log(f"Gemini: 429 (лимит запросов{', ' + q if q else ''}). Жду {wait:.0f} с и повторяю один раз.")
+                    _nap(wait)
+                    LLM_STATS["retries"] += 1
+                    continue
+        elif code in _TEMP_CODES:
+            LLM_STATS["r5xx"] += 1
+            wait = hint if hint is not None else min(5.0 * 2 ** retries, 30.0) * HTTP_BACKOFF
+            if retries < GEMINI_RETRIES and wait <= GEMINI_MAX_WAIT_S and _budget_ok(wait):
+                retries += 1
+                LLM_STATS["retries"] += 1
+                log(f"Gemini: {code} (сервис временно недоступен). Повтор {retries} из {GEMINI_RETRIES} через {wait:.0f} с.")
+                _nap(wait)
+                continue
+        raise _http_error(r, msg, quota)
+
 
 def _llm_call(prompt, max_tokens=400, json_mode=False, images=None):
     """Текст ответа нейросети: Gemini, если есть GEMINI_API_KEY, иначе Claude. images — [(mime, байты)]: в запрос уходят сами
@@ -283,17 +512,16 @@ def _llm_call(prompt, max_tokens=400, json_mode=False, images=None):
         if json_mode:
             config["responseMimeType"] = "application/json"
         parts = [{"text": prompt}] + [{"inline_data": {"mime_type": m, "data": base64.b64encode(b).decode("ascii")}} for m, b in images]
-        r = requests.post(
+        r = _llm_post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent",
             headers={"x-goog-api-key": GEMINI_KEY, "content-type": "application/json"},
             json={"contents": [{"parts": parts}], "generationConfig": config},
             timeout=timeout,
         )
-        r.raise_for_status()
         return r.json()["candidates"][0]["content"]["parts"][0]["text"]
     content = [{"type": "image", "source": {"type": "base64", "media_type": m, "data": base64.b64encode(b).decode("ascii")}}
                for m, b in images] + [{"type": "text", "text": prompt}]
-    r = requests.post(
+    r = _llm_post(
         "https://api.anthropic.com/v1/messages",
         headers={
             "x-api-key": ANTHROPIC_KEY,
@@ -303,7 +531,6 @@ def _llm_call(prompt, max_tokens=400, json_mode=False, images=None):
         json={"model": LLM_MODEL, "max_tokens": max_tokens, "messages": [{"role": "user", "content": content if images else prompt}]},
         timeout=timeout,
     )
-    r.raise_for_status()
     return r.json()["content"][0]["text"]
 
 
@@ -908,9 +1135,10 @@ def fetch_photos(ad):
 
 # ---------- Нейросеть: разбор объявления одним запросом (JSON) ----------
 
-_LLM = {"fails": 0, "off": False}
 _DEFECT_TYPES = ["lock", "water", "board", "charging", "screen", "biometric", "camera", "comms", "battery",
                  "screen_replaced", "repaired", "cosmetic", "parts"]
+AI_CACHE = {}  # id объявления -> {"sig", "data", "photo"}: удачные разборы нейросети. Только в памяти процесса: seen.json не затрагивается
+AI_CACHE_MAX = 200  # сколько разборов помнить (самые старые вытесняются)
 
 
 def llm_enabled():
@@ -918,19 +1146,41 @@ def llm_enabled():
 
 
 def llm_json(prompt, max_tokens=700, images=None):
-    """Вызов нейросети с JSON-ответом. После 2 подряд ошибок (или лимита 429) отключается до конца запуска."""
+    """Вызов нейросети с JSON-ответом. После 2 подряд ошибок (или 429, который не удалось переждать) отключается до конца запуска.
+    Чем кончился запрос — в _LLM["last"]: "ok", код HTTP, "parse" (ответ не разобрался), "net" (нет связи) или "off" (уже отключена)."""
     try:
         text = _llm_call(prompt, max_tokens, json_mode=True, **({"images": images} if images else {}))
         data = json.loads(text[text.index("{"): text.rindex("}") + 1])
         _LLM["fails"] = 0
+        _LLM["last"] = "ok"
         return data if isinstance(data, dict) else None
+    except LlmOff:  # запрос даже не отправлялся
+        _LLM["last"] = "off"
+        return None
     except Exception as e:
-        _LLM["fails"] += 1
         status = getattr(getattr(e, "response", None), "status_code", None)
-        if status == 429 or _LLM["fails"] >= 2:
-            _LLM["off"] = True
+        _LLM["last"] = status or ("parse" if isinstance(e, (ValueError, KeyError, IndexError, TypeError)) else "net")
+        _LLM["fails"] += 1
+        if status == 429:
+            llm_disable("лимит запросов Gemini (429)")
+        elif _LLM["fails"] >= 2:
+            llm_disable("две ошибки нейросети подряд")
         log("Ошибка нейросети:", e)
         return None
+
+
+def _ai_sig(info, refs):
+    """Отпечаток того, что уходит в нейросеть: текст объявления и список его фото. Объявление изменилось — отпечаток другой."""
+    h = hashlib.sha256(info.encode("utf-8"))
+    for path, yams in refs:
+        h.update(f"|{path}|{int(yams)}".encode("utf-8"))
+    return h.hexdigest()
+
+
+def _ai_store(key, sig, data, photo):
+    if key not in AI_CACHE and len(AI_CACHE) >= AI_CACHE_MAX:
+        AI_CACHE.pop(next(iter(AI_CACHE)))  # самый старый
+    AI_CACHE[key] = {"sig": sig, "data": copy.deepcopy(data), "photo": dict(photo)}
 
 
 PHOTO_SCHEMA = (', "photos": {"findings": [{"part": "экран|задняя крышка|рамка/корпус|камера|разъём|следы вскрытия|другое", '
@@ -950,13 +1200,13 @@ PHOTO_RULES = (
 
 
 def llm_analyze(ad, facts):
-    """Нейросеть читает объявление (и его фото, если они скачались) и возвращает структурированные факты.
-    Без ключа/при ошибке — None. Состояние разбора фото записывается в facts['photo']['status']."""
+    """Нейросеть читает объявление (и его фото, если они скачались) и возвращает структурированные факты — ОДНИМ запросом:
+    текст и фото уходят вместе. Без ключа, при ошибке или когда нейросеть отключена — None. Состояние разбора фото записывается
+    в facts['photo']['status']. Удачный разбор запоминается (AI_CACHE): то же объявление второй раз не тратит запрос и не качает фото."""
     ph = facts["photo"]
-    if not llm_enabled():
+    if not (GEMINI_KEY or ANTHROPIC_KEY):
         ph["status"] = "no_llm"
         return None
-    images, why = fetch_photos(ad)
     info = (
         f"Название: {ad.get('subject')}\n"
         f"Цена: {facts['price']:.0f} BYN" + (" (0 = не указана/договорная)" if not facts["price"] else "") + "\n"
@@ -966,6 +1216,25 @@ def llm_analyze(ad, facts):
         f"Модель по нашему определению: {facts['label']}\n"
         f"Описание: {facts['desc'] or 'в данных нет (только название)'}"
     )
+    key, sig = str(ad.get("ad_id")), _ai_sig(info, image_refs(ad)[:max(PHOTOS_MAX, 0)])
+    hit = AI_CACHE.get(key)
+    if hit and hit["sig"] == sig:
+        LLM_STATS["cached"] += 1
+        log("Нейросеть: разбор этого объявления уже есть в кеше, запрос не нужен:", key)
+        ph.update(copy.deepcopy(hit["photo"]))
+        return copy.deepcopy(hit["data"])
+    if _LLM["off"]:  # статус фото — про причину, по которой фото не разобраны: нет фото / PHOTOS_MAX=0 / нейросеть недоступна
+        has_photos = PHOTOS_MAX > 0 and bool(image_refs(ad))
+        ph["status"] = "llm_off" if has_photos else ("off" if PHOTOS_MAX <= 0 else "no_photos")
+        return None
+
+    def done(data, photo, cache=True):
+        ph.update(photo)
+        if cache and isinstance(data, dict):
+            _ai_store(key, sig, data, photo)
+        return data
+
+    images, why = fetch_photos(ad)
     head = "Ты помогаешь покупать и перепродавать телефоны на Куфаре (Беларусь). Разбери объявление.\n\n" + info + "\n\n"
     schema = (
         "Ответь ТОЛЬКО JSON такого вида (все тексты по-русски, коротко):\n"
@@ -983,18 +1252,19 @@ def llm_analyze(ad, facts):
     )
     text_prompt = head + schema.replace("@@PHOTOS@@", "") + rules
     if not images:
-        ph["status"] = why or "none"
-        return llm_json(text_prompt, 700)
+        return done(llm_json(text_prompt, 700), {"status": why or "none"}, cache=(why != "no_download"))
     data = llm_json(head + schema.replace("@@PHOTOS@@", PHOTO_SCHEMA) + rules + PHOTO_RULES, 1100, images=images)
     if isinstance(data, dict) and isinstance(data.get("photos"), dict):
-        ph.update(status="analyzed", n=len(images))
-        return data
-    ph["status"] = "error"  # запрос с фото не прошёл или ответ без разбора фото — разбираем хотя бы текст
-    if data is None and not _LLM["off"]:
-        return llm_json(text_prompt, 700)
+        return done(data, {"status": "analyzed", "n": len(images)})
+    # Запрос с фото не прошёл или ответ без разбора фото. Второй запрос (только текст) — лишь если дело в самом запросе/ответе
+    # (HTTP 400, ответ не разобрался). Лимит (429), сбой сервиса (503) и обрыв связи вторым запросом не лечатся: он только расходует лимит.
+    bad_request = _LLM["last"] in (400, "parse")
+    if data is None and bad_request and not _LLM["off"]:
+        return done(llm_json(text_prompt, 700), {"status": "error"})
     if isinstance(data, dict):
         data.pop("photos", None)
-    return data
+        return done(data, {"status": "error"})
+    return done(None, {"status": "error" if bad_request else "llm_off"})
 
 
 def merge_llm(facts, data):
@@ -2155,6 +2425,7 @@ PHOTO_WHY = {
     "no_photos": "в объявлении нет фото",
     "no_download": "фото не удалось загрузить с Куфара",
     "error": "нейросеть не приняла запрос с фото",
+    "llm_off": "нейросеть недоступна (лимит запросов или сбой сервиса)",
     "none": "анализ не запускался",
 }
 
@@ -2632,7 +2903,6 @@ def save_seen(seen):
     tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     os.replace(tmp, SEEN_FILE)
 
-
 _KEEP = ("ad_id", "ad_link", "subject", "type", "company_ad", "price_byn", "price_usd", "body", "body_short")
 
 
@@ -2734,6 +3004,7 @@ def cycle(seen, first_run):
     t0 = time.time()
     RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0, img_fails=0)
     _MARKET_REFRESHES["n"] = 0
+    llm_reset()
     queries = list(QUERIES) + pick_extra(t0)
     base = set() if first_run else set(STATE["baseline"])
     new_ads, quiet, learned, ok_queries = {}, {}, [], 0
@@ -2745,7 +3016,7 @@ def cycle(seen, first_run):
             continue
         ok_queries += 1
         for a in ads:
-            seen.touch(a["ad_id"])  # объявление ещё в выдаче: продлеваем память, чтобы оно не вернулось как «новое»
+            seen.touch(a["ad_id"])  # объявление ещё есть в выдаче: продлеваем память, чтобы оно не вернулось как «новое»
         if q in base:
             new_ads.update({ad["ad_id"]: ad for ad in ads if ad["ad_id"] not in seen})
         else:  # запрос запускается впервые: то, что уже висит, запоминаем молча, чтобы не завалить чат старым
@@ -2815,6 +3086,7 @@ def dry_run():
     t0 = time.time()
     RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0, img_fails=0)
     _MARKET_REFRESHES["n"] = 0
+    llm_reset()
     log(f"ТЕСТОВЫЙ ЗАПУСК: покажу до {DRY_LIMIT} подходящих объявлений. В Telegram ничего не уходит, seen.json не меняется.")
     shown, ok_queries = set(), 0
     for q in list(QUERIES) + pick_extra(t0):
@@ -2840,6 +3112,7 @@ def dry_run():
         if len(shown) >= DRY_LIMIT:
             break
         time.sleep(KUFAR_PAUSE)
+    llm_log_summary()
     if not ok_queries:
         sys.exit("Куфар не ответил ни на один запрос")
     log(f"Тестовый запуск закончен: показано объявлений — {len(shown)}")
@@ -2864,7 +3137,9 @@ def main():
 
     if "--report" in sys.argv:
         load_seen()  # заполняет HISTORY
-        return send_report()
+        send_report()
+        llm_log_summary()
+        return
 
     seen = load_seen()
     first_run = seen is None
@@ -2873,6 +3148,7 @@ def main():
     if "--once" in sys.argv:
         # Один проход и выход — для запуска по расписанию (GitHub Actions)
         ok_queries, total = cycle(seen, first_run)
+        llm_log_summary()
         # Куфар не ответил (на первом запуске нужны все запросы) — состояние не трогаем и падаем,
         # иначе в следующий раз все старые объявления придут как новые
         if not ok_queries or (first_run and ok_queries < total):
@@ -2896,6 +3172,7 @@ def main():
     while True:
         try:
             cycle(seen, first_run)
+            llm_log_summary(always=False)
             first_run = False
             save_seen(seen)
         except Exception as e:

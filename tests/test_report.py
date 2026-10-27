@@ -123,9 +123,12 @@ check("старый формат (список) читается", k.load_seen()
 import time as _t
 k.HISTORY["a"] = {"t": int(_t.time()), "m": "iPhone 5s", "p": 100, "c": "Б/у", "s": "s", "l": "l", "ok": True}
 k.HISTORY["old"] = {"t": int(_t.time()) - 40 * DAY, "m": "iPhone 5s", "p": 100, "c": "Б/у", "s": "s", "l": "l", "ok": True}
-k.save_seen({1, 2, 3, 4})
+k.save_seen(k.Seen({1, 2, 3, 4}))
 data = json.loads(k.SEEN_FILE.read_text())
-check("новый формат: seen + history, старое (40 дн.) вычищено", data["seen"] == [1, 2, 3, 4] and list(data["history"]) == ["a"], data)
+check("новый формат: seen с отметками времени + history, старое (40 дн.) вычищено",
+      {int(x) for x in data["seen"]} == {1, 2, 3, 4}
+      and all(isinstance(t, int) for t in data["seen"].values())
+      and list(data["history"]) == ["a"], data)
 k.HISTORY.clear()
 check("круг: сохранили и прочитали", k.load_seen() == {1, 2, 3, 4} and "a" in k.HISTORY)
 

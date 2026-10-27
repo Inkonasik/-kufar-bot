@@ -14,6 +14,11 @@ tmp = fresh_dir()
 sys.path.insert(0, str(tmp))
 import kufar_bot as k  # noqa: E402
 
+# Проверки этого файла — про формулы и счётчики, поэтому резерв на непроверенные функции и запас на удорожание ремонта выключены
+# (их работа проверяется отдельно, в test_stage2.py)
+k.RISK_RESERVE_PCT = 0
+k.REPAIR_OVERRUN_PCT = 0
+
 bad = 0
 VERBOSE = "-v" in sys.argv
 
@@ -76,26 +81,26 @@ c = r["calc"]
 check("перепродажа посчитана", c and c["list"] and c["quick"] and c["limit"] is not None and c["final"], c)
 check("список = медиана (округл. до 5)", c["list"] == k.rnd5(r["stats"]["med"]), c)
 check("быстрая <= список", c["quick"] <= c["list"], c)
-check("прибыль = быстрая - цена - расходы", abs(c["profit_quick"] - (c["quick"] - 620 - c["extra"] - c["repair"])) < 1e-6, c)
+check("прибыль = быстрая - цена - расходы", abs(c["profit"] - (c["quick"] - 620 - c["extra"] - c["rep_hi"])) < 1e-6, c)
 check("лимит <= быстрая", c["limit"] <= c["quick"], c)
-check("порог прибыли", c["target_profit"] >= k.MIN_PROFIT_BYN and c["target_profit"] % 5 == 0, c["target_profit"])
+check("порог прибыли", c["target"] >= k.MIN_PROFIT_BYN and c["target"] % 5 == 0, c["target"])
 check("лимит = быстрая − ремонт − расходы − целевая прибыль (вниз до 5)",
-      c["limit"] == k.floor5(c["quick"] - c["extra"] - c["repair"] - c["target_profit"]), c)
-check("исправный без ремонта: ремонт 0 и не «неизвестен»", c["repair"] == 0 and c["repair_unknown"] == [], c)
+      c["limit"] == k.floor5(c["quick"] - c["extra"] - c["rep_hi"] - c["target"]), c)
+check("исправный без ремонта: ремонт 0 и не «неизвестен»", c["rep_hi"] == 0 and c["rep_unknown"] == [], c)
+check("три уровня цены: желаемая <= максимум <= отказ", c["desired"] <= c["limit"] <= c["walk"], c)
 
 # --- дорогое объявление ---
 a2 = ad("iPhone 11 64gb", 90000, "Идеал")
 r2 = k.appraise(a2, k.rule_facts(a2))
 check("дорого/невыгодно", r2["verdict"] in ("ДОРОГО", "НЕВЫГОДНО"), r2["verdict"])
-check("целевая цена ниже цены продавца", r2.get("target") and r2["target"][1] < 900, r2.get("target"))
+check("максимум покупки ниже цены продавца", r2["plan"]["A"]["limit"] < 900, r2["plan"]["A"])
 check("перепродажа невыгодна: не «покупать по текущей цене»", r2["decision"][0] in ("skip", "bargain"), r2["decision"])
 
 # --- цена не указана / договорная ---
 a3 = ad("iPhone 11 64gb", 0, "Цена договорная")
 r3 = k.appraise(a3, k.rule_facts(a3))
 check("без цены: вердикта по цене нет", r3["verdict"] is None, r3["verdict"])
-check("без цены: ориентир для первого предложения", r3.get("target") and r3["target"][0] <= r3["target"][1], r3.get("target"))
-check("без цены: нет прибыли", "profit_quick" not in r3["calc"])
+check("без цены: уровни цены покупки есть, прибыли нет", r3["calc"]["limit"] > 0 and "profit" not in r3["calc"], r3["calc"])
 check("без цены: вывод «недостаточно данных» с причиной", r3["decision"][0] == "unknown" and "нет цены" in r3["decision"][1], r3["decision"])
 
 # --- мало аналогов ---
@@ -118,14 +123,14 @@ put_market("iPhone 11", clean + [[210, 300, 64, k.F_DEF | k.F_KINDS["screen"], 1
 r5 = k.appraise(a5, f5)
 check("дефект: 2 аналога с таким же дефектом (<3) -> оценка по общему рынку", r5["status"] == "ok" and r5["basis"] == "general", (r5["status"], r5["basis"]))
 check("дефект: счётчики раздельно: всего аналогов и с таким же дефектом", r5["found"] == 10 and r5["like_n"] == 2 and r5["like_need"] == 3, (r5["found"], r5["like_n"]))
-check("дефект: уверенность низкая, вердикта «выгодно/дорого» нет, «разумной цены» нет", r5["conf"] == "низкая" and r5["verdict"] is None and r5.get("target") is None, (r5["conf"], r5["verdict"]))
+check("дефект: уверенность низкая, вердикта «выгодно/дорого» нет", r5["conf"] == "низкая" and r5["verdict"] is None, (r5["conf"], r5["verdict"]))
 check("дефект: аналоги для показа без дефектов (общий рынок)", all(not c[3] & k.F_DEF for c in r5["comps"]), r5["comps"])
-check("дефект: ремонт неизвестен -> лимит предварительный, прибыль «до ремонта»", r5["calc"]["repair_unknown"] and not r5["calc"]["final"], r5["calc"])
+check("дефект: ремонт неизвестен -> лимит предварительный, прибыль «до ремонта»", r5["calc"]["rep_unknown"] and not r5["calc"]["final"], r5["calc"])
 put_market("iPhone 11", clean + [[210 + i, 300 + i * 20, 64, k.F_DEF | k.F_KINDS["screen"], 1, 0] for i in range(4)])
 r5 = k.appraise(a5, f5)
 check("дефект: 4 аналога с таким же дефектом -> оценка по ним", r5["status"] == "ok" and r5["basis"] == "defect" and r5["found"] == 4 and r5["like_n"] == 4, (r5["status"], r5.get("basis"), r5.get("found")))
 check("дефект: пул — аналоги с дефектом", all(c[3] & k.F_DEF for c in r5["comps"]), r5["comps"])
-check("дефект по дефектным: ремонт не вычитается (дефект уже в цене аналогов)", r5["calc"]["repair"] == 0 and r5["calc"]["repair_unknown"] == [] and r5["calc"]["final"], r5["calc"])
+check("дефект по дефектным: ремонт не вычитается (дефект уже в цене аналогов)", r5["plan"]["A"]["rep_hi"] == 0 and r5["plan"]["A"]["rep_unknown"] == [] and r5["plan"]["A"]["final"], r5["plan"]["A"])
 check("дефект: вердикт по дефектным", r5["verdict"] in ("ОЧЕНЬ ВЫГОДНО", "ВЫГОДНО", "СРЕДНИЙ ВАРИАНТ", "ДОРОГО", "НЕВЫГОДНО"), r5["verdict"])
 # аналоги с ДРУГИМ дефектом «таким же» не считаются
 put_market("iPhone 11", clean + [[220 + i, 300 + i * 20, 64, k.F_DEF | k.F_KINDS["battery"], 1, 0] for i in range(5)])
@@ -143,12 +148,13 @@ k.REPAIR_COSTS.update({"screen": 80})
 check("известный ремонт", k.known_repair_cost(f5) == 80, k.known_repair_cost(f5))
 r5b = k.appraise(a5, f5)
 c5 = r5b["calc"]
-check("ремонт известен: учтён один раз", r5b["basis"] == "general" and c5["repair"] == 80 and c5["final"] and c5["repair_unknown"] == [], c5)
-check("лимит = быстрая − 80 − расходы − цель", c5["limit"] == k.floor5(c5["quick"] - 80 - c5["extra"] - c5["target_profit"]), c5)
-check("прибыль = быстрая − цена − ремонт − расходы", abs(c5["profit_quick"] - (c5["quick"] - 400 - 80 - c5["extra"])) < 1e-6, c5)
+check("ремонт известен: учтён один раз", r5b["basis"] == "general" and c5["rep_hi"] == 80 and c5["final"] and c5["rep_unknown"] == [], c5)
+check("лимит = быстрая − 80 − расходы − цель", c5["limit"] == k.floor5(c5["quick"] - 80 - c5["extra"] - c5["target"]), c5)
+check("прибыль = быстрая − цена − ремонт − расходы", abs(c5["profit"] - (c5["quick"] - 400 - 80 - c5["extra"])) < 1e-6, c5)
 put_market("iPhone 11", clean + [[210 + i, 300 + i * 20, 64, k.F_DEF | k.F_KINDS["screen"], 1, 0] for i in range(4)])
 r5e = k.appraise(a5, f5)
-check("по аналогам с таким же дефектом ремонт НЕ вычитается, даже если цена ремонта задана", r5e["basis"] == "defect" and r5e["calc"]["repair"] == 0, r5e["calc"])
+check("вариант 1 (по аналогам с таким же дефектом): ремонт НЕ вычитается, даже если цена ремонта задана; вариант 2 — вычитает один раз",
+      r5e["basis"] == "defect" and r5e["plan"]["A"]["rep_hi"] == 0 and r5e["plan"]["B"]["rep_hi"] == 80, (r5e["plan"]["A"], r5e["plan"]["B"]))
 k.REPAIR_COSTS.clear()
 
 # --- запчасти / критичное ---
@@ -235,20 +241,21 @@ check("XS: дефект «аккумулятор 74%» найден", "battery" 
 check("XS: 34 найденных аналога и 0 с подтверждённым дефектом — раздельно", rxs["found"] == 34 and rxs["like_n"] == 0, (rxs["found"], rxs["like_n"]))
 check("XS: основа — общий рынок, уверенность низкая, вердикта «выгодно/дорого» нет", rxs["basis"] == "general" and rxs["conf"] == "низкая" and rxs["verdict"] is None, (rxs["basis"], rxs["conf"], rxs["verdict"]))
 cx, stx = rxs["calc"], rxs["stats"]
+check("XS: вариант 2 (ремонт) — основной: вариант 1 оценить не из чего (аналогов с слабым акб нет)", rxs["plan"]["best"] == "B" and rxs["plan"]["A"] is None, rxs["plan"]["best"])
 check("XS: цена выставления = медиана 34 объявлений (445)", cx["list"] == k.rnd5(stx["med"]) == 445, cx)
 check("XS: быстрая продажа = нижняя четверть (390)", cx["quick"] == k.rnd5(stx["q1"]) == 390, cx)
-check("XS: целевая прибыль = 12% от быстрой, вверх до 5 (50)", cx["target_profit"] == 50, cx["target_profit"])
+check("XS: целевая прибыль = 12% от быстрой, вверх до 5 (50)", cx["target"] == 50, cx["target"])
 check("XS: лимит до ремонта = 390 − 0 − 50 = 340", cx["raw"] == 340 and cx["limit"] == 340, cx)
-check("XS: ремонт не известен — не выдуман, лимит предварительный", cx["repair_unknown"] and cx["repair"] == 0 and not cx["final"], cx)
-check("XS: запас на ремонт 340 − 250 = 90; прибыль до ремонта 140 / 195", cx["reserve"] == 90 and cx["profit_quick"] == 140 and cx["profit_list"] == 195, cx)
+check("XS: ремонт не известен — не выдуман, лимит предварительный", cx["rep_unknown"] and cx["rep_hi"] == 0 and not cx["final"], cx)
+check("XS: запас на ремонт 340 − 250 = 90; прибыль до ремонта 140 / 195", cx["gap"] == 90 and cx["profit"] == 140 and cx["profit_opt"] == 195, cx)
 check("XS: вывод «недостаточно данных» с конкретикой (ремонт ≤ 90 BYN)", rxs["decision"][0] == "unknown" and rxs["decision"][1].startswith(FOUR[3]) and "90 BYN" in rxs["decision"][1], rxs["decision"])
 
 # известная цена замены аккумулятора: ремонт вычитается один раз, вывод однозначный
 for repair, price_kop, code, limit in ((60, 25000, "buy", 280), (120, 25000, "bargain", 220), (200, 25000, "skip", 140), (340, 25000, "skip", 0)):
     _a, _f, _r = xs(price_kop, repair={"battery": repair})
     c_ = _r["calc"]
-    check(f"XS ремонт {repair}: лимит = 390 − {repair} − 0 − 50, ремонт один раз", c_["final"] and c_["repair"] == repair and c_["limit"] == limit, c_)
-    check(f"XS ремонт {repair}: прибыль = 390 − 250 − {repair}", c_["profit_quick"] == 390 - 250 - repair and c_["profit_list"] == 445 - 250 - repair, c_)
+    check(f"XS ремонт {repair}: лимит = 390 − {repair} − 0 − 50, ремонт один раз", c_["final"] and c_["rep_hi"] == repair and c_["limit"] == limit, c_)
+    check(f"XS ремонт {repair}: прибыль = 390 − 250 − {repair}", c_["profit"] == 390 - 250 - repair and c_["profit_opt"] == 445 - 250 - repair, c_)
     check(f"XS ремонт {repair}: вывод {code}", _r["decision"][0] == code, _r["decision"])
 _a, _f, _r = xs(25000, repair={"battery": 120})
 check("XS ремонт 120: «только после торга до 220 BYN»", _r["decision"][1].startswith("Покупать только после торга до 220 BYN"), _r["decision"])
@@ -258,7 +265,7 @@ check("XS ремонт 120 и «без торга»: не покупать", _r[
 k.EXTRA_COSTS_BYN = 10
 _a, _f, _r = xs(25000, repair={"battery": 60})
 c_ = _r["calc"]
-check("прочие расходы: лимит 270 (−10 один раз), прибыль 70", c_["limit"] == 270 and c_["profit_quick"] == 390 - 250 - 60 - 10, c_)
+check("прочие расходы: лимит 270 (−10 один раз), прибыль 70", c_["limit"] == 270 and c_["profit"] == 390 - 250 - 60 - 10, c_)
 k.EXTRA_COSTS_BYN = 0
 # цена выше лимита при неизвестном ремонте
 _a, _f, _r = xs(38000)
@@ -270,7 +277,9 @@ same = [[800 + i, 280 + i * 10, 64, k.F_DEF | k.F_KINDS["battery"], 1, 0] for i 
 _a, _f, _r = xs(25000, repair={"battery": 60}, extra=same)
 c_ = _r["calc"]
 check("XS: 4 аналога с акб в заголовке -> оценка по ним", _r["basis"] == "defect" and _r["found"] == 4 and _r["like_n"] == 4, (_r["basis"], _r["found"]))
-check("XS по аналогам с дефектом: ремонт НЕ вычитается (даже при известной цене)", c_["repair"] == 0 and c_["final"] and c_["raw"] == c_["quick"] - c_["target_profit"], c_)
+ca = _r["plan"]["A"]
+check("XS вариант 1 по аналогам с дефектом: ремонт НЕ вычитается (даже при известной цене)", ca["rep_hi"] == 0 and ca["final"] and ca["raw"] == ca["quick"] - ca["target"], ca)
+check("XS вариант 2: ремонт вычтен один раз", _r["plan"]["B"]["rep_hi"] == 60 and _r["plan"]["B"]["raw"] == _r["plan"]["B"]["quick"] - 60 - _r["plan"]["B"]["target"], _r["plan"]["B"])
 # подозрительно низкая цена (вдвое ниже рынка, дефектов нет): «покупать» не говорим
 _a, _f, _r = xs(10000, "Состояние хорошее, акб 90%.")
 check("XS 100 BYN (вдвое ниже рынка): не «покупать», а проверить iCloud/обман", _r["decision"][0] == "unknown" and "вдвое ниже рынка" in _r["decision"][1], _r["decision"])

@@ -46,7 +46,8 @@ def stub(reply):
 
 
 def reset():
-    k._LLM.update(fails=0, off=False)
+    k._LLM.update(fails=0, off=False, n429=0, last=None, why="")
+    k.AI_CACHE.clear()  # тесты независимы друг от друга: разбор из кеша не подменяет вызов заглушки
     calls.clear()
 
 

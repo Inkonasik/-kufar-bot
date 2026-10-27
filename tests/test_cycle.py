@@ -42,6 +42,11 @@ def ad_msgs(res):
     return [m for m in res["sent"] + res["plain"] if m.startswith("📱")]
 
 
+def seen_ids(state):
+    """В объединённой версии seen.json хранит id как ключи словаря с отметками времени."""
+    return {int(x) for x in (state or {}).get("seen", {})}
+
+
 def legacy_file(n=1300):
     """seen.json в формате старой версии бота: только seen и history."""
     d = fresh_dir()
@@ -58,11 +63,11 @@ fx = lambda: fresh_dir(LEGACY)  # noqa: E731
 # ---------- 1. первый запуск ----------
 d = fresh_dir()
 res, st = run(d, [(1, "iPhone 5s"), (2, "iPhone 14")])
-check("1 первый запуск: exit 0, одно сообщение о старте, объявления запомнены молча",
-      res["exit"] == 0 and len(res["sent"]) == 1 and "запущен" in res["sent"][0] and set(st["seen"]) == {1, 2}, res["sent"])
+check("1 первый запуск: exit 0, одно сообщение о старте, подходящие объявления запомнены молча",
+      res["exit"] == 0 and len(res["sent"]) == 1 and "запущен" in res["sent"][0] and seen_ids(st) == {1}, res["sent"])
 res, st = run(d, [(1, "iPhone 5s"), (2, "iPhone 14"), (3, "iPhone 6s 64gb"), (4, "iPhone 15")])
-check("2 второй запуск: ровно одно уведомление про 6s, без повторного «запущен»",
-      res["exit"] == 0 and len(res["sent"]) == 1 and "iPhone 6s" in res["sent"][0] and set(st["seen"]) == {1, 2, 3, 4}, res["sent"])
+check("2 второй запуск: ровно одно уведомление про 6s, неподдерживаемые модели не попадают в память",
+      res["exit"] == 0 and len(res["sent"]) == 1 and "iPhone 6s" in res["sent"][0] and seen_ids(st) == {1, 3}, res["sent"])
 res, st = run(d, [(1, "iPhone 5s"), (2, "iPhone 14"), (3, "iPhone 6s 64gb"), (4, "iPhone 15")])
 check("3 без новых — тишина", res["exit"] == 0 and res["sent"] == [], res["sent"])
 
@@ -93,8 +98,9 @@ check("A уведомления: 7, 6s, S9 (без чехла и iPhone 14, бе
       and any("iPhone 6s" in m for m in msgs) and any("Galaxy S9" in m for m in msgs), [m[:40] for m in msgs])
 check("A разовое уведомление об обновлении", sum("Бот обновлён" in m for m in res["sent"]) == 1)
 check("A ключи состояния", set(st) >= {"seen", "history", "market", "baseline", "notice", "pending"}, list(st))
-check("A старые id и история сохранены", set(OLD_IDS) <= set(st["seen"]) and set(OLD_HIST) <= set(st["history"]))
-check("A новые id в seen (и отфильтрованные тоже)", {9001, 9002, 9003, 9004, 9005} <= set(st["seen"]))
+check("A старые id и история сохранены", set(OLD_IDS) <= seen_ids(st) and set(OLD_HIST) <= set(st["history"]))
+check("A подходящие новые id в seen, аксессуары и неподдерживаемые модели не сохраняются",
+      {9001, 9004, 9005} <= seen_ids(st) and not ({9002, 9003} & seen_ids(st)), seen_ids(st))
 check("A baseline: старые + новые запросы", {"iphone", "samsung", "ipod touch", "айфон", "самсунг"} <= set(st["baseline"]), st["baseline"])
 check("A нет временного файла", not (d / "seen.json.tmp").exists())
 check("A дедупликация: одно сообщение на объявление", len(msgs) == len({m.split("\n")[0] for m in msgs}))
@@ -104,12 +110,12 @@ check("A повторный запуск: тишина, уведомление �
 d = fresh_dir()
 (d / "seen.json").write_text(json.dumps([1, 2, 3]))
 res, st = run(d, [(1, "iPhone 5s"), (4, "iPhone 8")])
-check("A2 старейший формат (список id) читается", res["exit"] == 0 and len(ad_msgs(res)) == 1 and isinstance(st, dict) and {1, 2, 3, 4} <= set(st["seen"]))
+check("A2 старейший формат (список id) читается", res["exit"] == 0 and len(ad_msgs(res)) == 1 and isinstance(st, dict) and {1, 2, 3, 4} <= seen_ids(st))
 
 # ---------- B. новый запрос запоминается молча ----------
 d = fx()
 res, st = run(d, [], market={"айфон": [[777, "Айфон 7 plus"]]})
-check("B новый запрос: без уведомлений, id запомнен", res["exit"] == 0 and ad_msgs(res) == [] and 777 in st["seen"], res["sent"])
+check("B новый запрос: без уведомлений, id запомнен", res["exit"] == 0 and ad_msgs(res) == [] and 777 in seen_ids(st), res["sent"])
 res, st = run(d, [], market={"айфон": [[777, "Айфон 7 plus"], [778, "Айфон 8"]]})
 check("B дальше приходит только новое", len(ad_msgs(res)) == 1 and "Айфон 8" in ad_msgs(res)[0], res["sent"])
 
@@ -118,7 +124,7 @@ comps = [{"id": 2000 + i, "subject": "iPhone 11 64gb", "price": 600 + i * 10} fo
 d = fx()
 res, st = run(d, [{"id": 5000, "subject": "iPhone 11 64gb", "price": 590, "desc": "Идеальное состояние, акб 90%, полный комплект"}], market={"iphone 11": comps})
 m = (ad_msgs(res) or [""])[0]
-check("C сообщение с ценой, целью, происхождением цен, выводом и пометкой «не сделок»", all(x in m for x in ("📊 Цена относительно рынка:", "🎯", "💵 Откуда цены", "✅ <b>Вывод для перепродажи:</b>", "не сделок")), m)
+check("C сообщение: рынок по категориям, два варианта, итог и пометка «не сделок»", all(x in m for x in ("📊 <b>Рынок</b>", "💵 <b>Вариант 1", "🔧 <b>Вариант 2", "✅ <b>Итоговая рекомендация:</b>", "не сделок")), m)
 check("C ссылки на реальные аналоги", "https://www.kufar.by/item/2000" in m or "https://www.kufar.by/item/2005" in m)
 check("C одна загрузка аналогов", sum(g == "iphone 11|100" for g in res["gets"]) == 1)
 check("C кеш аналогов сохранён", "iPhone 11" in st["market"] and len(st["market"]["iPhone 11"]["items"]) >= 10)
@@ -128,23 +134,23 @@ check("C второй запуск: свежий кеш, повторной за
 # ---------- D. сбои Telegram ----------
 d = fx()
 res, st = run(d, [(9101, "iPhone 8 64gb")], tg="500")
-check("D Telegram 500: объявление не потеряно (не в seen, лежит в очереди повторов)", res["exit"] == 0 and 9101 not in st["seen"] and "9101" in st["pending"], st["pending"].keys())
+check("D Telegram 500: объявление не потеряно (не в seen, лежит в очереди повторов)", res["exit"] == 0 and 9101 not in seen_ids(st) and "9101" in st["pending"], st["pending"].keys())
 d = fx()
 res, st = run(d, [(9102, "iPhone 8 64gb")], tg="400parse")
-check("D ошибка разметки: ушёл простой текст, объявление отмечено", res["plain"] and "<b>" not in res["plain"][0] and 9102 in st["seen"])
+check("D ошибка разметки: ушёл простой текст, объявление отмечено", res["plain"] and "<b>" not in res["plain"][0] and 9102 in seen_ids(st))
 d = fx()
 res, st = run(d, [(9103, "iPhone 8 64gb")], tg="400chat")
-check("D «chat not found»: объявление не теряется", 9103 not in st["seen"] and "9103" in st["pending"])
+check("D «chat not found»: объявление не теряется", 9103 not in seen_ids(st) and "9103" in st["pending"])
 d = fx()
 res, st = run(d, [(9104, "iPhone 8 64gb")], tg="429once")
-check("D лимит Telegram 429: повтор после паузы, сообщение доставлено", len(ad_msgs(res)) == 1 and 9104 in st["seen"] and res["tg_calls"] == 3 or
-      (len(ad_msgs(res)) == 1 and 9104 in st["seen"]), (res["tg_calls"], res["sent"]))
+check("D лимит Telegram 429: повтор после паузы, сообщение доставлено", len(ad_msgs(res)) == 1 and 9104 in seen_ids(st) and res["tg_calls"] == 3 or
+      (len(ad_msgs(res)) == 1 and 9104 in seen_ids(st)), (res["tg_calls"], res["sent"]))
 
 # ---------- E. очередь повторов ----------
 d = fx()
 res, st = run(d, [(9201, "iPhone 8 64gb")], tg="500")
 res, st = run(d, [], tg="ok")  # объявление уже пропало из выдачи Куфара
-check("E повтор: объявление доставлено, хотя в выдаче его уже нет", len(ad_msgs(res)) == 1 and "iPhone 8" in ad_msgs(res)[0] and 9201 in st["seen"] and st["pending"] == {},
+check("E повтор: объявление доставлено, хотя в выдаче его уже нет", len(ad_msgs(res)) == 1 and "iPhone 8" in ad_msgs(res)[0] and 9201 in seen_ids(st) and st["pending"] == {},
       (res["sent"][:1], st["pending"].keys()))
 res, st = run(d, [], tg="ok")
 check("E после доставки повторов нет", ad_msgs(res) == [])
@@ -157,9 +163,9 @@ res, st = run(d, [], tg="ok")
 check("E очередь старше 24 часов отбрасывается", ad_msgs(res) == [] and st["pending"] == {}, st["pending"].keys())
 d = fx()
 res, st = run(d, [(9203, "iPhone 8 64gb")], RUN_BUDGET_S="0")
-check("E не хватило времени: объявление в очереди, не в seen", ad_msgs(res) == [] and 9203 not in st["seen"] and "9203" in st["pending"])
+check("E не хватило времени: объявление в очереди, не в seen", ad_msgs(res) == [] and 9203 not in seen_ids(st) and "9203" in st["pending"])
 res, st = run(d, [], tg="ok")
-check("E следующий запуск его отправляет", len(ad_msgs(res)) == 1 and 9203 in st["seen"])
+check("E следующий запуск его отправляет", len(ad_msgs(res)) == 1 and 9203 in seen_ids(st))
 
 # ---------- F. повторы запросов с паузой ----------
 d = fx()
@@ -182,7 +188,8 @@ raw = [{"ad_id": 8001, "type": "sell", "subject": None, "price_byn": "abc", "ad_
        {"ad_id": 8004, "type": "sell", "subject": ["не", "строка"], "ad_parameters": [], "ad_link": "x"}]
 res, st = run(d, [], raw=raw)
 check("G странные объявления не роняют запуск; нормальное с пустой ценой пришло", res["exit"] == 0 and len(ad_msgs(res)) == 1 and "цена не указана" in ad_msgs(res)[0], res["sent"])
-check("G странные записаны в seen (не зацикливаются)", {8001, 8003, 8004} <= set(st["seen"]))
+check("G сохраняется подходящее объявление; мусор не занимает память",
+      8003 in seen_ids(st) and not ({8001, 8004} & seen_ids(st)), seen_ids(st))
 res2, st2 = run(d, [], raw=raw)
 check("G повторный запуск: тишина", ad_msgs(res2) == [])
 

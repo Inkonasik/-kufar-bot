@@ -6,8 +6,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BOT = Path(os.environ.get("BOT_FILE") or HERE.parent / "kufar_bot.py")
-for _name in ("HTTP_BACKOFF", "SEND_PAUSE", "KUFAR_PAUSE"):
-    os.environ.setdefault(_name, "0")  # в тестах не ждём
+for _name in ("HTTP_BACKOFF", "SEND_PAUSE", "KUFAR_PAUSE", "GEMINI_MIN_GAP_S"):
+    os.environ.setdefault(_name, "0")  # в тестах не ждём (настоящий ограничитель Gemini проверяет test_ratelimit.py на поддельных часах)
+os.environ.setdefault("GEMINI_RPM", "1000")
 
 
 def fresh_dir(seen_file=None):
