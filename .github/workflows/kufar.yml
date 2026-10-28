@@ -1,10 +1,16 @@
 name: kufar-monitor
 
 on:
-  workflow_dispatch:   # запуск раз в 5 минут делает cron-job.org (и кнопка «Run workflow» вручную)
+  workflow_dispatch:   # запуск раз в 5 минут делает cron-job.org (и кнопка «Run workflow» вручную).
+                       # Расписание — ТОЛЬКО там: не добавляй сюда schedule, иначе будет два источника запусков.
+    inputs:
+      dry_run:
+        description: "Тестовый запуск: ничего не отправлять и не сохранять, только показать в логе, что ушло бы и почему"
+        type: boolean
+        default: false   # cron-job.org флажок не передаёт — его запуски всегда обычные
 
 permissions:
-  contents: write      # чтобы сохранять seen.json обратно в репозиторий
+  contents: write      # чтобы сохранять seen.json и market_history.json обратно в репозиторий
 
 concurrency:
   group: kufar-monitor
@@ -23,6 +29,7 @@ jobs:
         uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip          # requests не скачивается каждый раз: запуск стартует быстрее, свежие объявления успевают уйти
 
       - name: Установить зависимости
         timeout-minutes: 3
@@ -40,38 +47,48 @@ jobs:
           REPAIR_COSTS: ${{ vars.REPAIR_COSTS }}
           EXTRA_COSTS_BYN: ${{ vars.EXTRA_COSTS_BYN }}
           MIN_PROFIT_BYN: ${{ vars.MIN_PROFIT_BYN }}
+          FRESH_MAX_AGE_S: ${{ vars.FRESH_MAX_AGE_S }}   # пусто = 300 с (5 минут)
+          DRY_RUN: ${{ inputs.dry_run && 'true' || '' }}
         run: python kufar_bot.py --once
 
       # always(): даже если шаг выше упал или завершился по таймауту, уже обработанные объявления сохраняются
-      # (бот пишет seen.json после каждого отправленного сообщения), и они не придут повторно
-      - name: Сохранить список просмотренных объявлений
+      # (бот пишет seen.json и базу после каждого отправленного сообщения), и они не придут повторно.
+      # Оба файла — в одном коммите. Бот пишет их атомарно (временный файл + замена), так что обрыв не оставит половину файла.
+      - name: Сохранить состояние и базу рынка
         if: always()
         run: |
           git config user.name "kufar-bot"
           git config user.email "kufar-bot@users.noreply.github.com"
 
-          if [ ! -f seen.json ]; then
-            echo "Файла seen.json нет (бот не успел его создать) — сохранять нечего."
+          FILES=""
+          for f in seen.json market_history.json; do
+            if [ -f "$f" ]; then FILES="$FILES $f"; fi
+          done
+          if [ -z "$FILES" ]; then
+            echo "Файлов состояния нет (бот не успел их создать) — сохранять нечего."
             exit 0
           fi
 
-          git add -- seen.json
+          git add -- $FILES
 
           if git diff --cached --quiet; then
-            echo "Изменений в seen.json нет."
+            echo "Изменений в состоянии нет."
             exit 0
           fi
 
-          git commit -m "update seen"
+          git commit -m "update seen and market history"
 
-          for attempt in 1 2 3; do
+          # 5 попыток с растущей паузой: сеть GitHub иногда сбоит, а в main могут прийти твои коммиты (тогда rebase;
+          # при конфликте в seen.json / market_history.json побеждает только что записанное ботом состояние)
+          for attempt in 1 2 3 4 5; do
             if git push origin HEAD:main; then
               exit 0
             fi
-            echo "Push не прошёл (попытка $attempt из 3): в main появились новые коммиты. Подтягиваю их и повторяю."
+            echo "Push не прошёл (попытка $attempt из 5). Подтягиваю main и повторяю."
             git pull --rebase -X theirs origin main || git rebase --abort || true
-            sleep 3
+            sleep $((attempt * 3))
           done
 
-          echo "Не удалось сохранить seen.json."
+          echo "Не удалось сохранить состояние. Следующий запуск начнёт с прошлой версии; повторов не будет:"
+          echo "объявления старше 5 минут бот не отправляет никогда."
           exit 1
