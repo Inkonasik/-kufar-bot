@@ -8,7 +8,12 @@
   export TG_CHAT_ID=...        # твой chat id: python kufar_bot.py --get-chat-id
   python kufar_bot.py
   python kufar_bot.py --once   # один проход и выход (для запуска по расписанию)
-  python kufar_bot.py --report # недельная аналитика цен в Telegram (по истории из seen.json)
+  python kufar_bot.py --report # недельная аналитика цен в Telegram (по истории из seen.json и базе market_history.json)
+  python kufar_bot.py --dry-run # проверка на живом Куфаре без Telegram: для каждого объявления — ушло бы оно или нет и почему
+
+ГЛАВНОЕ ПРАВИЛО: в Telegram уходят только публикации не старше 5 минут (FRESH_MAX_AGE_S). Дата берётся из list_time, проверяется
+до разбора и ещё раз прямо перед отправкой; поднятые старые объявления отсеиваются по номеру (см. originality). Лучше пропустить
+публикацию, чем прислать старую. Всё увиденное (и старое тоже) копится в базе рынка и используется только для оценки цен.
 
 Что ищет (по умолчанию): iPhone 2G…11 (включая X/XR/XS/XS Max), iPhone SE 2016–2022, iPod touch, Galaxy S1–S9.
 iPhone 12 и новее, Galaxy S10 и новее, планшеты, чехлы/стёкла/запчасти и «куплю» отбрасываются.
@@ -60,6 +65,20 @@ iPhone 12 и новее, Galaxy S10 и новее, планшеты, чехлы/
   GEMINI_RETRIES     сколько раз повторять запрос после 503/500/502/504 (2: паузы 5 и 10 с или Retry-After). После 429 — один повтор;
                      второй 429 за запуск, суточная квота или просьба ждать дольше GEMINI_MAX_WAIT_S отключают нейросеть до конца запуска
   GEMINI_MAX_WAIT_S  дольше этого одного ожидания ради повтора бот не ждёт, сек (60)
+Свежесть уведомлений (главное правило: в Telegram уходят только публикации не старше FRESH_MAX_AGE_S):
+  FRESH_MAX_AGE_S    максимальный возраст публикации, сек (300; больше 300 поставить нельзя — можно только меньше). Граница
+                     включительно: ровно 300 с — ещё отправляем, 301 с — уже нет. Возраст считается от поля list_time (единственное
+                     время в API Куфара) и проверяется ещё раз прямо перед отправкой; дата «из будущего» в момент отправки не принимается
+  BUMP_TOLERANCE_MIN list_time меняется и при поднятии объявления. Номера объявлений Куфар выдаёт по порядку, поэтому если уже видели
+                     объявление с БОЛЬШИМ номером, опубликованное раньше чем за BUMP_TOLERANCE_MIN минут до этого, — значит,
+                     это объявление создано давно и только поднято: не отправляем (30)
+  MAX_PAGES          сколько страниц выдачи читать по запросу, пока на странице есть свежие объявления (3)
+База рынка (market_history.json — наблюдения за объявлениями, по ним считаются аналоги):
+  MARKET_DB_MAX      сколько объявлений хранить в базе (6000); при переполнении удаляются те, кого дольше всего не видели
+  MARKET_DB_DAYS     через сколько дней без появления в выдаче запись удаляется (60)
+  MARKET_ACTIVE_DAYS запись считается активной, если объявление видели в выдаче не позже стольких дней назад (3). В ТЕКУЩУЮ оценку цены
+                     идут только активные записи (и свежая выдача); более старые — только в отдельную историческую сводку
+  MESSAGE_STYLE      short (по умолчанию) — короткое сообщение; full — подробный разбор, как раньше
 """
 import base64
 import copy
@@ -112,14 +131,18 @@ EXTRA_QUERIES = [q.strip() for q in (_extra_env if _extra_env is not None else (
     "apple,galaxy,айпод,iphone 7,iphone 8,iphone x,iphone 11,iphone se,galaxy s8,galaxy s9,айфон 7,айфон 11"
     if _queries_env is None and USE_NEW_MODELS else "")).split(",") if q.strip()]
 LEGACY_QUERIES = ("iphone", "samsung", "ipod touch")  # эти запросы работали до обновления: их выдача уже в seen.json
-NOTICE_VERSION = 1  # версия разового уведомления «бот обновлён»
+NOTICE_VERSION = 2  # версия разового уведомления «бот обновлён»
 
 KUFAR_URL = "https://api.kufar.by/search-api/v2/search/rendered-paginated"
 CATEGORY = 17010  # Мобильные телефоны
 SEEN_FILE = Path(__file__).with_name("seen.json")
 HISTORY = {}  # id объявления -> запись для недельной аналитики (хранится в seen.json)
-STATE = {"market": {}, "baseline": [], "notice": 0, "pending": {}}  # кеш аналогов, «запомненные» запросы, версия уведомления, очередь повторов
-RUN = {"deadline": 0.0, "cards": 0, "card_fails": 0, "img_fails": 0}  # состояние текущего запуска: крайнее время, счётчики запросов карточек
+STATE = {"market": {}, "baseline": [], "notice": 0, "pending": {}, "marks": {}}  # кеш аналогов, «запомненные» запросы, версия уведомления,
+# очередь повторов, метки номеров для защиты от поднятых объявлений (см. originality)
+# состояние текущего запуска: крайнее время, счётчики запросов карточек; db_comps — сколько аналогов добавила база рынка;
+# no_photo / no_refresh — на фото или обновление аналогов уже нет времени до конца «окна свежести»
+RUN = {"deadline": 0.0, "cards": 0, "card_fails": 0, "img_fails": 0, "db_comps": 0, "no_photo": False, "no_refresh": False,
+       "ad_until": None}  # ad_until — до какого момента объявление ещё свежее (ограничивает ожидание нейросети и фото)
 
 
 def _env_float(name, default):
@@ -171,6 +194,17 @@ MAX_CARD_FETCH = int(_env_float("MAX_CARD_FETCH", 25))  # сколько кар�
 PENDING_TTL_H = _env_float("PENDING_TTL_HOURS", 24)    # сколько часов повторять неотправленное объявление
 DRY_RUN = "--dry-run" in sys.argv or os.getenv("DRY_RUN", "").strip().lower() in ("1", "true", "yes")  # тестовый запуск: без Telegram и без записи
 DRY_LIMIT = int(_env_float("DRY_RUN_LIMIT", 5))        # сколько объявлений показать в тестовом запуске
+FRESH_MAX_AGE_S = _env_range("FRESH_MAX_AGE_S", 300, 30, 300)  # публикация старше этого (сек) в Telegram не уходит; потолок 300
+FRESH_FUTURE_TOL_S = 5.0  # list_time впереди часов бота до 5 с — погрешность часов: бот ждёт, пока время станет прошлым;
+# дальше — дата недостоверна. Свежей «будущая» дата не считается никогда: перед отправкой возраст должен быть ≥ 0
+BUMP_TOLERANCE_MIN = _env_range("BUMP_TOLERANCE_MIN", 30, 5, 720)  # см. описание выше: защита от поднятых объявлений
+REF_WINDOW_H = 1.0  # опорное объявление для проверки номера должно быть опубликовано не раньше чем за 1 ч до границы
+SEED_PAGES = 6      # сколько страниц выдачи дочитать, если опорных меток не хватает (первый запуск, долгий простой)
+MAX_PAGES = int(_env_range("MAX_PAGES", 3, 1, 10))     # страниц выдачи на запрос, пока на странице есть свежие
+MARKET_DB_MAX = int(_env_range("MARKET_DB_MAX", 6000, 100, 100000))
+MARKET_DB_DAYS = _env_range("MARKET_DB_DAYS", 60, 7, 3650)
+MARKET_ACTIVE_DAYS = _env_range("MARKET_ACTIVE_DAYS", 3, 1, 14)
+MESSAGE_STYLE = (os.getenv("MESSAGE_STYLE") or "short").strip().lower()
 
 # Объявление должно содержать хотя бы одно из этих слов (название + производитель)
 WANT = ("iphone", "айфон", "apple", "ipod", "айпод", "samsung", "самсунг", "galaxy", "галакси")
@@ -217,37 +251,86 @@ def http_get(url, params=None, timeout=20, tries=3):
         time.sleep(wait * HTTP_BACKOFF)
 
 
-def fetch(query, size=30):
+_NEXT = {}  # запрос -> курсор следующей страницы из последнего ответа (пагинация Куфара: pagination.pages[label=next].token)
+
+
+def _next_token(data):
+    try:
+        for p in (data.get("pagination") or {}).get("pages") or []:
+            if isinstance(p, dict) and p.get("label") == "next" and isinstance(p.get("token"), str) and p["token"]:
+                return p["token"]
+    except AttributeError:
+        pass
+    return None
+
+
+def fetch(query, size=30, cursor=None):
+    """Одна страница выдачи, отсортированной по list_time (новые сверху). Курсор следующей страницы запоминается в _NEXT."""
     params = {"query": query, "sort": "lst.d", "size": size, "lang": "ru"}
     # iPod touch лежит в «Аудиотехнике» (иногда в «Мобильных телефонах») — для него ищем по всем категориям
     if not any(w in query.lower() for w in ("ipod", "айпод")):
         params["cat"] = CATEGORY
+    if cursor:
+        params["cursor"] = cursor
     r = http_get(KUFAR_URL, params)
     r.raise_for_status()
-    return r.json().get("ads", [])
+    data = r.json() or {}
+    _NEXT[query] = _next_token(data)
+    return data.get("ads", [])
+
+
+def fetch_fresh(query, now=None):
+    """Выдача по запросу: первая страница и следующие, пока на странице ещё есть свежие объявления (не больше MAX_PAGES).
+    Поднятые объявления тоже стоят сверху, поэтому одной страницы при всплеске публикаций может не хватить."""
+    _NEXT.pop(query, None)
+    ads = list(fetch(query))
+    pages = 1
+    while pages < MAX_PAGES and _NEXT.get(query) and ads:
+        last = parse_list_time((ads[-1] or {}).get("list_time")) if isinstance(ads[-1], dict) else None
+        if last is None or (now or time.time()) - last > FRESH_MAX_AGE_S + 60:
+            break  # дальше по сортировке только более старые
+        if RUN["deadline"] and time.time() > RUN["deadline"]:
+            break
+        time.sleep(KUFAR_PAUSE)
+        try:
+            more = fetch(query, cursor=_NEXT[query])
+        except Exception as e:
+            log(f"Следующая страница ({query}) не получена:", e)
+            break
+        if not more:
+            break
+        ads.extend(more)
+        pages += 1
+    return ads
 
 
 ITEM_URL = "https://api.kufar.by/search-api/v2/item/{}/rendered"
 
 
-def fetch_body(ad_id):
-    """Описание объявления из карточки (в списке Куфар отдаёт body = null). При любой ошибке — пустая строка.
+def fetch_card(ad_id):
+    """Карточка объявления (в выдаче Куфар отдаёт body = null): словарь result или {}. При любой ошибке — {}.
     За запуск — не больше MAX_CARD_FETCH карточек; после 3 неудач подряд (не считая 404) карточки до конца запуска не запрашиваем."""
     if RUN["cards"] >= MAX_CARD_FETCH or RUN["card_fails"] >= 3:
-        return ""
+        return {}
     RUN["cards"] += 1
     try:
         r = http_get(ITEM_URL.format(ad_id), timeout=15, tries=2)
         if r.status_code == 404:  # объявление уже снято — это не сбой
-            return ""
+            return {}
         r.raise_for_status()
-        body = (r.json().get("result") or {}).get("body")
+        res = (r.json() or {}).get("result") or {}
         RUN["card_fails"] = 0
-        return body if isinstance(body, str) else ""
+        return res if isinstance(res, dict) else {}
     except Exception as e:
         RUN["card_fails"] += 1
-        log(f"Описание {ad_id} не получено:", e)
-        return ""
+        log(f"Карточка {ad_id} не получена:", e)
+        return {}
+
+
+def fetch_body(ad_id):
+    """Только описание из карточки ('' если его нет)."""
+    body = fetch_card(ad_id).get("body")
+    return body if isinstance(body, str) else ""
 
 
 def param(ad, key):
@@ -258,19 +341,27 @@ def param(ad, key):
     return None
 
 
-def price_byn(ad):
-    """Цена в BYN. В API она в копейках; 0 = не указана."""
+def _kopecks(v):
+    """Цена из API Куфара: строка или число в КОПЕЙКАХ («40000» = 400,00 BYN; проверено на живых ответах: price_usd «13580»
+    = $135,80 у той же вещи, курс ≈ 2,95). 0 — цена не указана или некорректна (отрицательная, нечисловая, бесконечность)."""
+    if v is None or isinstance(v, bool):
+        return 0
     try:
-        return int(ad.get("price_byn") or 0) / 100
+        x = float(str(v).strip().replace(",", ".")) if not isinstance(v, (int, float)) else float(v)
     except ValueError:
         return 0
+    if not math.isfinite(x) or x <= 0:
+        return 0
+    return round(x) / 100
+
+
+def price_byn(ad):
+    """Цена в BYN; 0 = не указана. Берётся только из поля price_byn — никакие догадки (нейросети, описания) её не меняют."""
+    return _kopecks(ad.get("price_byn"))
 
 
 def price_usd(ad):
-    try:
-        return int(ad.get("price_usd") or 0) / 100
-    except ValueError:
-        return 0
+    return _kopecks(ad.get("price_usd"))
 
 
 def basic_filter(ad):
@@ -293,6 +384,155 @@ def basic_filter(ad):
     if MAX_PRICE_BYN and p and p > MAX_PRICE_BYN:
         return False
     return True
+
+
+# ---------- Свежесть публикации ----------
+# В API Куфара (поиск и карточка) из дат есть только list_time, ISO 8601 в UTC: «2026-10-28T14:13:15Z». Это время ПОСЛЕДНЕГО
+# размещения: при поднятии объявления оно меняется (проверено: объявление № 31038107 из старого диапазона номеров стояло в
+# выдаче с list_time того же утра). Поэтому свежесть = list_time не старше FRESH_MAX_AGE_S И подтверждение, что это не поднятие.
+
+_MIN_TS, _MAX_TS = 1_400_000_000, 10_000_000_000  # 2014…2286 год: за пределами — мусор, а не дата
+
+
+def parse_list_time(v):
+    """list_time -> unix-время (float) или None. Понимает ISO 8601 с зоной («…Z», «…+03:00»), unix-время в секундах и в
+    миллисекундах (числом или строкой). Без зоны, пустое, нечисловое, вне 2014…2286 — None: такой дате доверять нельзя."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        x = float(v)
+    elif isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        if re.fullmatch(r"\d{9,14}(?:\.\d+)?", s):
+            x = float(s)
+        else:
+            try:
+                dt = datetime.fromisoformat(s[:-1] + "+00:00" if s[-1:] in ("Z", "z") else s)
+            except ValueError:
+                return None
+            if dt.tzinfo is None:
+                return None  # часовой пояс не указан — время не подтверждено
+            x = dt.timestamp()
+    else:
+        return None
+    if not math.isfinite(x):
+        return None
+    if x >= 1e11:  # миллисекунды
+        x /= 1000.0
+    return x if _MIN_TS <= x < _MAX_TS else None
+
+
+def fresh_status(ad, now=None, strict=False):
+    """(свежее ли, причина, возраст в секундах, list_time). Причины: '' (свежее), no_date, bad_date, future, ahead, old.
+    Граница включительно: возраст ровно FRESH_MAX_AGE_S — ещё свежее, на долю секунды больше — уже нет.
+    Дата впереди часов бота больше чем на FRESH_FUTURE_TOL_S — future (недостоверна). На 0…5 с впереди — при отборе кандидатов
+    это погрешность часов (кандидат), а при strict=True (проверка перед отправкой) — ahead: отправлять ещё нельзя."""
+    raw = ad.get("list_time") if isinstance(ad, dict) else None
+    lt = parse_list_time(raw)
+    if lt is None:
+        return False, ("no_date" if raw in (None, "") else "bad_date"), None, None
+    age = (time.time() if now is None else now) - lt
+    if age < -FRESH_FUTURE_TOL_S:
+        return False, "future", age, lt
+    if age < 0 and strict:
+        return False, "ahead", age, lt
+    if age > FRESH_MAX_AGE_S:
+        return False, "old", age, lt
+    return True, "", age, lt
+
+
+def fresh_before_send(ad):
+    """Проверка прямо перед отправкой: строго 0 ≤ возраст ≤ FRESH_MAX_AGE_S. Если дата на 0…5 с впереди (часы бота чуть
+    отстают), ждём эти секунды и проверяем снова — «будущее» время свежим не считается."""
+    ok, reason, age, lt = fresh_status(ad, strict=True)
+    if reason == "ahead":
+        time.sleep(-age + 0.01)
+        ok, reason, age, lt = fresh_status(ad, strict=True)
+    return ok, reason, age, lt
+
+
+MARK_BUCKET_S = 600  # метки номеров: на каждые 10 минут list_time — самый большой номер объявления, опубликованного в эти 10 минут
+
+
+def marks_add(marks, ads):
+    """Обновляет метки {начало 10-минутки: [наибольший номер, его list_time]} по наблюдённым объявлениям."""
+    for ad in ads:
+        if not isinstance(ad, dict):
+            continue
+        try:
+            ad_id = int(ad.get("ad_id"))
+        except (TypeError, ValueError):
+            continue
+        lt = parse_list_time(ad.get("list_time"))
+        if lt is None or ad_id <= 0:
+            continue
+        b = str(int(lt // MARK_BUCKET_S) * MARK_BUCKET_S)
+        cur = marks.get(b)
+        if not cur or ad_id > cur[0]:
+            marks[b] = [ad_id, int(lt)]
+
+
+def marks_cover(marks, now):
+    """Есть ли опорные метки, нужные для подтверждения публикаций прямо сейчас: опубликованные в окне
+    [now − 5 мин − BUMP_TOLERANCE_MIN − REF_WINDOW_H; now − BUMP_TOLERANCE_MIN]."""
+    hi = now - BUMP_TOLERANCE_MIN * 60
+    lo = hi - FRESH_MAX_AGE_S - REF_WINDOW_H * 3600
+    return any(lo <= rt <= hi for _rid, rt in marks.values())
+
+
+def seed_marks(now, query=None):
+    """Первый запуск или бот долго не работал: опорных меток нет, и все настоящие новинки были бы «неподтверждёнными».
+    Дочитываем выдачу широкого запроса дальше (до SEED_PAGES страниц), пока не дойдём до объявлений старше нужного окна.
+    Это только метки номеров: ничего из дочитанного не отправляется (старое не проходит проверку возраста)."""
+    query = query or (QUERIES[0] if QUERIES else "iphone")
+    target = now - BUMP_TOLERANCE_MIN * 60 - 10 * 60
+    pages, seen_ads = 0, []
+    _NEXT.pop(query, None)
+    try:
+        page = fetch(query, size=50)
+        pages = 1
+        while page:
+            seen_ads.extend(page)
+            marks_add(STATE["marks"], page)
+            last = parse_list_time(page[-1].get("list_time")) if isinstance(page[-1], dict) else None
+            if (last is not None and last < target) or pages >= SEED_PAGES or not _NEXT.get(query):
+                break
+            if RUN["deadline"] and time.time() > RUN["deadline"]:
+                break
+            time.sleep(KUFAR_PAUSE)
+            page = fetch(query, size=50, cursor=_NEXT[query])
+            pages += 1
+    except Exception as e:
+        log("Опорные метки: дочитать выдачу не удалось:", e)
+    log(f"Опорные метки: дочитал {pages} стр. выдачи «{query}» ({len(seen_ads)} объявлений); "
+        + ("покрытие есть" if marks_cover(STATE["marks"], now) else "покрытия по-прежнему нет — новинки будут «неподтверждёнными»"))
+    return seen_ads
+
+
+def originality(ad_id, lt, marks):
+    """Новая ли это публикация, а не поднятие старого объявления: (да/нет, причина).
+    Номера Куфар раздаёт по порядку (проверено на живой выдаче). Если объявление с БОЛЬШИМ номером было опубликовано раньше
+    границы «list_time − BUMP_TOLERANCE_MIN», значит, наше объявление создано ещё раньше — это поднятие (bumped): строгое
+    доказательство. Если опорных наблюдений за час до границы нет вовсе, новизну подтвердить нечем (unconfirmed) — не отправляем.
+    ОГРАНИЧЕНИЕ: подтверждение новизны — не доказательство. Оно означает «номер больше всех, опубликованных за час до границы»,
+    то есть объявление создано не раньше примерно чем за полтора часа до публикации. Поднятие объявления, созданного недавно и
+    ни разу не попавшего боту на глаза, так не отличить: API Куфара даты первой публикации не отдаёт.
+    Номер НЕ делает объявление свежим: свежесть даёт только list_time; номер только отсеивает поднятые."""
+    cutoff = lt - BUMP_TOLERANCE_MIN * 60
+    older = [(rid, rt) for rid, rt in marks.values() if rt <= cutoff]
+    if any(rid > ad_id for rid, _rt in older):
+        return False, "bumped"  # строгое доказательство: объявление старше опубликованного до границы
+    if not any(rt >= cutoff - REF_WINDOW_H * 3600 for _rid, rt in older):
+        return False, "unconfirmed"  # опорных наблюдений рядом с границей нет — новизну не подтвердить
+    return True, ""
+
+
+SKIP_RU = {"no_date": "нет даты публикации", "bad_date": "дата публикации повреждена", "future": "дата публикации в будущем",
+           "old": "старше допустимого возраста", "bumped": "старое объявление, поднятое заново",
+           "unconfirmed": "новизну не подтвердить (мало опорных данных)", "republished": "уже было в базе с более ранней датой",
+           "notified": "уже отправлено или было в выдаче при первом запуске", "expired": "устарело к моменту отправки", "ahead": "дата ещё в будущем"}
 
 
 # ---------- Нейросеть (необязательно) ----------
@@ -443,8 +683,20 @@ def _http_error(r, msg="", quota=""):
     return requests.HTTPError(text + (f" [квота: {quota}]" if quota else ""), response=r)
 
 
+SEND_RESERVE_S = 10.0  # столько секунд оставляем на сборку и отправку сообщения после нейросети
+
+
+def _ad_left():
+    """Сколько секунд ещё можно тратить на разбор текущего объявления (None — ограничения нет)."""
+    until = RUN.get("ad_until")
+    return None if until is None else until - SEND_RESERVE_S - time.time()
+
+
 def _budget_ok(wait):
-    """Успеем ли мы дождаться: запуск не должен вылезти за RUN_BUDGET_S."""
+    """Успеем ли мы дождаться: запуск не должен вылезти за RUN_BUDGET_S, а объявление — устареть из-за ожидания нейросети."""
+    left = _ad_left()
+    if left is not None and wait > left:
+        return False
     return not RUN["deadline"] or time.time() + wait <= RUN["deadline"]
 
 
@@ -507,6 +759,11 @@ def _llm_call(prompt, max_tokens=400, json_mode=False, images=None):
     картинки (base64), а не ссылки на них. При ошибке бросает исключение."""
     images = images or []
     timeout = 60 if images else 30
+    left = _ad_left()
+    if left is not None:  # запрос не должен пережить «окно свежести» объявления
+        if left < 5:
+            raise LlmOff("не хватает времени до конца окна свежести")
+        timeout = min(timeout, left)
     if GEMINI_KEY:
         config = {"maxOutputTokens": max_tokens}
         if json_mode:
@@ -696,6 +953,13 @@ def build_report(now=None):
     now = now or time.time()
     week = 7 * 86400
     rows = [r for r in HISTORY.values() if r.get("ok", True)]
+    # наблюдения из базы рынка (время — когда объявление впервые попалось боту); записи из HISTORY в приоритете
+    for k_, rec in _mdb_ads().items():
+        lab = (rec.get("model") or {}).get("label")
+        if k_ in HISTORY or not lab or lab == "Другое" or not rec.get("price_byn") or not rec.get("first_seen"):
+            continue
+        rows.append({"t": int(rec["first_seen"]), "m": lab, "p": float(rec["price_byn"]), "c": rec.get("condition") or "не указано",
+                     "s": rec.get("title") or "", "l": rec.get("url") or "", "ok": True})
     cur = [r for r in rows if now - week <= r["t"] <= now]
     prev = [r for r in rows if now - 2 * week <= r["t"] < now - week]
     if not cur:
@@ -974,22 +1238,32 @@ def parse_memory(text):
     return int(m.group(1)) if m else 0
 
 
-def parse_battery(text):
-    """Процент АКБ берём только из явной конструкции вроде «акб 100%» или «100% battery».
-    Не ищем произвольное число через 18 символов: так можно принять посторонний процент за здоровье батареи."""
+_BATTERY_TERM = r"(?:акб|аккумулятор\w*|батаре\w*|battery(?:\s+health)?|здоровье\s+батареи|(?:емкость|ёмкость)\s+(?:аккумулятора|батареи|акб)|емкост\w*)"
+_BATTERY_RX = (re.compile(rf"{_BATTERY_TERM}\s*[:=\-]?\s*(\d{{2,3}})\s*%"), re.compile(rf"(\d{{2,3}})\s*%\s*{_BATTERY_TERM}"))
+
+
+def battery_values(text):
+    """Все явно названные проценты АКБ (40…100) в порядке появления, без повторов."""
     t = " ".join((text or "").lower().replace("ё", "е").split())
-    battery_term = r"(?:акб|аккумулятор\w*|батаре\w*|battery(?:\s+health)?|здоровье\s+батареи|(?:емкость|ёмкость)\s+(?:аккумулятора|батареи|акб)|емкост\w*)"
-    patterns = (
-        rf"{battery_term}\s*[:=\-]?\s*(\d{{2,3}})\s*%",
-        rf"(\d{{2,3}})\s*%\s*{battery_term}",
-    )
-    for pattern in patterns:
-        m = re.search(pattern, t)
-        if m:
-            value = int(m.group(1))
-            if 40 <= value <= 100:
-                return value
-    return None
+    found = []
+    for rx in _BATTERY_RX:
+        for m in rx.finditer(t):
+            v = int(m.group(1))
+            if 40 <= v <= 100:
+                found.append((m.start(), v))
+    out = []
+    for _pos, v in sorted(found):
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def parse_battery(text):
+    """Процент АКБ берём только из явной конструкции вроде «акб 100%» или «100% battery» — ровно то число, что написал продавец.
+    Не ищем произвольное число через 18 символов: так можно принять посторонний процент за здоровье батареи.
+    Если названо два разных процента («акб 100%… акб 90%»), значение не выбираем: None (противоречие отмечает rule_facts)."""
+    vals = battery_values(text)
+    return vals[0] if len(vals) == 1 else None
 
 
 def find_defects(text):
@@ -1034,14 +1308,76 @@ def ad_description(ad):
     return ""
 
 
+def _labels_in(text):
+    """Разные модели, названные в тексте: заголовок режется по «/», «,», «;», «или» и каждый кусок разбирается отдельно."""
+    out = []
+    for seg in re.split(r"\s*(?:/|;|,|\bили\b|\bor\b)\s*", (text or "").lower()):
+        if seg.strip():
+            lab = model_label(" ".join(seg.split()))
+            if lab != "Другое" and lab not in out:
+                out.append(lab)
+    return out
+
+
+def _same_model(a, b):
+    """iPhone SE без поколения и iPhone SE (2020) — не противоречие, а уточнение."""
+    return a == b or (a.startswith("iPhone SE") and b.startswith("iPhone SE"))
+
+
+def model_facts(ad):
+    """(модель, уверенность, источник, противоречия). Модель не угадываем: если заголовок называет две разные модели или
+    расходится с параметром «Модель» Куфара — «Другое» (оценки не будет) и запись о противоречии."""
+    title = ad.get("subject") or ""
+    if not isinstance(title, str):
+        title = ""
+    brand, model = param(ad, "phones_brand") or "", param(ad, "phones_model") or ""
+    base = " ".join(f"{title} {brand} {model}".lower().split())
+    label = model_label(base)
+    in_title = _labels_in(title)
+    p_label = model_label(" ".join(f"{brand} {model}".lower().split())) if model else "Другое"
+    conflicts = []
+    if len(in_title) > 1 and not all(_same_model(in_title[0], x) for x in in_title[1:]):
+        conflicts.append(f"в заголовке несколько моделей: {', '.join(in_title)}")
+    t_label = in_title[0] if in_title else "Другое"
+    if t_label != "Другое" and p_label != "Другое" and not _same_model(t_label, p_label):
+        conflicts.append(f"модель: в заголовке {t_label}, в параметрах {p_label}")
+    if conflicts:
+        return "Другое", "противоречие", "заголовок и параметры", conflicts
+    if t_label != "Другое" and p_label != "Другое":
+        # уточнение поколения SE берём из того источника, где оно названо
+        lab = p_label if facts_gen(p_label) and not facts_gen(t_label) else (t_label if facts_gen(t_label) else label)
+        return lab, "высокая", "заголовок и параметры совпадают", []
+    if t_label != "Другое":
+        return label, "высокая", "заголовок", []
+    if p_label != "Другое":
+        return label, "средняя", "параметр «Модель» Куфара", []
+    return label, ("низкая" if label != "Другое" else "не определена"), "текст", []
+
+
+def memory_facts(ad, desc):
+    """(объём ГБ или 0, источник, противоречие или ''). Заголовок и параметр Куфара — основные источники, описание — запасной."""
+    title = ad.get("subject") or ""
+    if not isinstance(title, str):
+        title = ""
+    t_mem = parse_memory(title)
+    p_raw = f"{param(ad, 'phablet_phones_memory') or ''} {param(ad, 'phones_memory') or ''}".strip()
+    p_mem = parse_memory(p_raw) if p_raw else 0
+    if t_mem and p_mem and t_mem != p_mem:
+        return 0, "", f"память: в заголовке {t_mem} ГБ, в параметрах {p_mem} ГБ"
+    if t_mem:
+        return t_mem, "заголовок", ""
+    if p_mem:
+        return p_mem, "параметры Куфара", ""
+    d_mem = parse_memory(desc)
+    return (d_mem, "описание", "") if d_mem else (0, "", "")
+
+
 def rule_facts(ad):
     """Факты об объявлении по правилам (названию, параметрам и описанию, если оно есть в ответе Куфара)."""
     title = ad.get("subject") or ""
     desc = ad_description(ad)
-    brand, model = param(ad, "phones_brand") or "", param(ad, "phones_model") or ""
-    base = " ".join(f"{title} {brand} {model}".lower().split())
     full = f"{title}. {desc}".lower()
-    label = model_label(base)
+    label, model_conf, model_src, conflicts = model_facts(ad)
     cond_param = (param(ad, "condition") or "").lower()
     if "нов" in cond_param and "б/у" not in cond_param:
         cond = "new"
@@ -1053,13 +1389,21 @@ def rule_facts(ad):
         cond = "used"
     else:
         cond = "unknown"
-    mem = parse_memory(f"{title} {param(ad, 'phablet_phones_memory') or ''} {param(ad, 'phones_memory') or ''}") or parse_memory(desc)
+    mem, mem_src, mem_conflict = memory_facts(ad, desc)
+    if mem_conflict:
+        conflicts.append(mem_conflict)
     defects = find_defects(full)
     if PARTS_RE.search(full):
         defects["parts"] = "на запчасти"
-    bat = parse_battery(full)
+    bats = battery_values(full)
+    bat = bats[0] if len(bats) == 1 else None
+    if len(bats) > 1:
+        conflicts.append("аккумулятор: названо несколько значений — " + ", ".join(f"{v}%" for v in bats))
     if bat is not None and bat < 80 and "battery" not in defects:
         defects["battery"] = f"аккумулятор {bat}%"
+    cp = (param(ad, "condition") or "").lower()
+    if cond == "new" and ("б/у" in cp or defects.get("cosmetic")) and "нов" not in cp:
+        conflicts.append("состояние: в тексте «новый», а в параметрах или описании — следы использования")
     if _BARGAIN_NO.search(full):
         bargain = "no"
     elif _BARGAIN_YES.search(full):
@@ -1074,7 +1418,14 @@ def rule_facts(ad):
         "region": param(ad, "region") or "", "area": param(ad, "area") or "",
         "seller": "магазин" if ad.get("company_ad") else "частник",
         "price": price_byn(ad), "is_phone": True, "summary": "", "risks": [], "llm": False, "repair_cost": None,
-        "model_conflict": False,
+        "model_conflict": model_conf == "противоречие", "model_conf": model_conf, "model_src": model_src,
+        "mem_src": mem_src, "conflicts": conflicts,
+        "price_src": ad.get("_price_src") or PRICE_SRC_SEARCH, "price_conflict": ad.get("_price_conflict"),
+        "price_unverified": bool(ad.get("_price_unverified")),
+        "price_card_invalid": "_price_card_invalid" in ad, "price_card_raw": ad.get("_price_card_invalid"),
+        "currency": ad.get("currency") if isinstance(ad.get("currency"), str) else "",
+        # источник каждого факта: всё из текста — это слова продавца, а не проверка
+        "kit_src": "текст продавца" if kit_from_text(full) else "",
     }
 
 
@@ -1132,6 +1483,9 @@ def fetch_photos(ad):
     got = []
     for path, yams in refs[:PHOTOS_MAX]:
         if RUN["deadline"] and time.time() > RUN["deadline"]:
+            break
+        left = _ad_left()
+        if left is not None and left < 30:  # на скачивание и разбор фото времени уже нет
             break
         img = _download_image(path, yams)
         if img:
@@ -1238,6 +1592,9 @@ def llm_analyze(ad, facts):
         return copy.deepcopy(hit["data"])
     if _LLM["off"]:
         ph["status"] = "llm_off"
+        return None
+    if RUN.get("no_photo"):
+        ph["status"] = "no_time"
         return None
 
     images, why = fetch_photos(ad)
@@ -1418,11 +1775,20 @@ def market_query(label):
     return re.sub(r"\s+", " ", label.lower().replace("+", " plus")).strip()
 
 
+def title_key(title):
+    """Короткий отпечаток заголовка (нижний регистр, без пробелов): одинаковые объявления-дубли дают одинаковый отпечаток."""
+    t = re.sub(r"[^0-9a-zа-я]+", "", normalize_text(title if isinstance(title, str) else ""))
+    return hashlib.sha1(t.encode("utf-8")).hexdigest()[:8] if t else ""
+
+
 def comp_item(ad, key):
-    """Сжатая запись об аналоге [id, цена BYN, память ГБ, флаги, код региона, поколение SE] или None."""
+    """Сжатая запись об аналоге [id, цена BYN, память ГБ, флаги, код региона, поколение SE, отпечаток заголовка] или None.
+    Не аналоги: «куплю/скупка/муляж», аксессуары, другая модель, объявления без цены."""
     if ad.get("type") != "sell":
         return None
     title = ad.get("subject") or ""
+    if not isinstance(title, str) or any(w in title.lower() for w in BAD_WORDS):
+        return None
     if looks_like_accessory(title):
         return None
     base = " ".join(f"{title} {param(ad, 'phones_brand') or ''} {param(ad, 'phones_model') or ''}".lower().split())
@@ -1457,7 +1823,23 @@ def comp_item(ad, key):
     if ad.get("company_ad"):
         flags |= F_SHOP
     mem = parse_memory(f"{title} {param(ad, 'phablet_phones_memory') or ''} {param(ad, 'phones_memory') or ''}") or parse_memory(desc)
-    return [int(ad["ad_id"]), int(round(price)), mem, flags, region_code(param(ad, "region")), gen]
+    return [int(ad["ad_id"]), int(round(price)), mem, flags, region_code(param(ad, "region")), gen, title_key(title)]
+
+
+def dedupe_items(items):
+    """Убирает повторы: тот же номер или явный дубль (тот же заголовок, цена, память и регион под разными номерами)."""
+    out, ids, sig = [], set(), set()
+    for it in items:
+        if it[0] in ids:
+            continue
+        s = (it[6], it[1], it[2], it[4]) if len(it) > 6 and it[6] else None
+        if s and s in sig:
+            continue
+        ids.add(it[0])
+        if s:
+            sig.add(s)
+        out.append(it)
+    return out
 
 
 def refresh_market(label):
@@ -1473,39 +1855,60 @@ def refresh_market(label):
             if code in (400, 422) and size != 30:
                 continue  # Куфар не принял большой размер — повторяем с обычным
             raise
-    items, ids = [], set()
+    items = []
     for ad in ads or []:
         try:
             it = comp_item(ad, key)
         except Exception:
             continue
-        if it and it[0] not in ids:
-            ids.add(it[0])
+        if it:
             items.append(it)
-    return items
+            mdb_observe(ad, comp=it, key=key)  # каждое увиденное объявление-аналог пополняет базу рынка
+    marks_add(STATE["marks"], ads or [])
+    return dedupe_items(items)
+
+
+def _merge_db(items, key, now):
+    """Аналоги из свежей выдачи + АКТИВНЫЕ наблюдения из базы рынка (их цена — последняя увиденная), без повторов номеров.
+    Возвращает (список, сколько добавлено из базы)."""
+    have = {x[0] for x in items}
+    extra = [it for it in mdb_comps(key, now) if it[0] not in have]
+    merged = dedupe_items(list(items) + extra)
+    return merged, len(merged) - len(dedupe_items(list(items)))
 
 
 def market_items(label, now=None):
-    """(аналоги, возраст кеша в секундах, устарел ли, причина). Свежий кеш не трогаем; при сбое берём старый и помечаем."""
+    """(аналоги, возраст кеша в секундах, устарел ли, причина). Свежий кеш не трогаем; при сбое берём старый и помечаем.
+    К выдаче добавляются наблюдения из базы рынка (market_history.json): число добавленных — в RUN["db_comps"].
+    Куфар недоступен и кеша нет, но в базе хватает наблюдений — оценка идёт по базе (помечается как устаревшая)."""
     now = now or time.time()
     key = market_key(label)
     entry = STATE["market"].get(key)
     age = (now - entry["t"]) if entry else None
+    RUN["db_comps"] = 0
     if entry and age < MARKET_TTL_H * 3600:
-        return entry["items"], age, False, None
-    reason = "capped"  # обновление не разрешено: лимит запросов за запуск или вышло время запуска
-    if _MARKET_REFRESHES["n"] < MARKET_MAX_REFRESH and not (RUN["deadline"] and time.time() > RUN["deadline"]):
+        items, RUN["db_comps"] = _merge_db(entry["items"], key, now)
+        return items, age, False, None
+    reason = "capped"  # обновление не разрешено: лимит запросов за запуск, вышло время запуска или окно свежести
+    if (_MARKET_REFRESHES["n"] < MARKET_MAX_REFRESH and not (RUN["deadline"] and time.time() > RUN["deadline"])
+            and not RUN.get("no_refresh")):
         _MARKET_REFRESHES["n"] += 1
         reason = "failed"
         try:
             items = refresh_market(label)
             STATE["market"][key] = {"t": int(now), "items": items[:150]}
             time.sleep(KUFAR_PAUSE)
+            items, RUN["db_comps"] = _merge_db(items, key, now)
             return items, 0, False, None
         except Exception as e:
             log(f"Не удалось обновить аналоги ({label}):", e)
-    if entry:
-        return entry["items"], age, True, None
+    if entry and age <= MARKET_ACTIVE_DAYS * 86400:  # кеш старше окна активности — уже не текущие предложения
+        items, RUN["db_comps"] = _merge_db(entry["items"], key, now)
+        return items, age, True, None
+    db = mdb_comps(key, now)
+    if len(db) >= REF_MIN:
+        RUN["db_comps"] = len(db)
+        return dedupe_items(db), None, True, None
     return None, None, False, reason
 
 
@@ -1515,6 +1918,8 @@ MIN_DEFECT_COMPS = 3  # аналогов с такими же проблемам
 
 
 def rnd5(x):
+    """До ближайших 5 BYN — для медианы (цена выставления). Быстрая продажа и максимум покупки округляются ВНИЗ (floor5),
+    резерв и целевая прибыль — ВВЕРХ (ceil5): так округление никогда не делает сделку выгоднее, чем она есть."""
     return int(round(x / 5.0)) * 5
 
 
@@ -1808,7 +2213,7 @@ def _interp(anchors, level):
     t = (level - a) / (b - a)
     quick = anchors[a][0] + (anchors[b][0] - anchors[a][0]) * t
     lst = anchors[a][1] + (anchors[b][1] - anchors[a][1]) * t
-    return rnd5(quick), rnd5(lst), (a, b)
+    return floor5(quick), rnd5(lst), (a, b)  # быструю продажу округляем вниз: оценка должна быть консервативной
 
 
 def asis_estimate(facts, snap, clean, like):
@@ -1820,19 +2225,19 @@ def asis_estimate(facts, snap, clean, like):
     row_ok = snap["rows"]["ok"]
     if cat == "ok" and row_ok["st"] and row_ok["n"] >= SNAP_NEED:  # исправность названа словами — сравниваем с такими же
         st = row_ok["st"]
-        return {"src": "ok", "found": True, "quick": rnd5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
+        return {"src": "ok", "found": True, "quick": floor5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
     if cat in ("ok", "unk"):
         st = clean["st"] if clean else None
         if st:
-            return {"src": "clean", "found": True, "quick": rnd5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
+            return {"src": "clean", "found": True, "quick": floor5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
         return None
     if like and like.get("st"):
         st = like["st"]
-        return {"src": "same", "found": True, "quick": rnd5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
+        return {"src": "same", "found": True, "quick": floor5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
     row = snap["rows"][cat]
     if row["st"] and row["n"] >= SNAP_NEED:
         st = row["st"]
-        return {"src": "cat", "found": True, "quick": rnd5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
+        return {"src": "cat", "found": True, "quick": floor5(st["q1"]), "list": rnd5(st["med"]), "n": st["n"], "st": st, "cat": cat}
     anchors = {}
     if clean and clean["st"]:
         anchors[0] = (clean["st"]["q1"], clean["st"]["med"], clean["st"]["n"])
@@ -1915,7 +2320,7 @@ def build_plan(ad, facts, snap, clean, like):
     if asis:
         plan["A"] = deal_calc(asis["quick"], asis["list"], price, None, (), reserve_on)
     if rp["needs"] and not crit and clean and clean["st"]:
-        cq, cl = rnd5(clean["st"]["q1"]), rnd5(clean["st"]["med"])
+        cq, cl = floor5(clean["st"]["q1"]), rnd5(clean["st"]["med"])
         known = (rp["lo"], rp["hi"]) if rp["items"] else None
         plan["B"] = deal_calc(cq, cl, price, known, rp["unknown"], True)
         plan["B"]["clean_n"] = clean["st"]["n"]
@@ -1928,7 +2333,7 @@ def build_plan(ad, facts, snap, clean, like):
                     plan["sens"].append((r, deal_calc(cq, cl, price, (float(r), float(r)), (), True)["limit"]))
     if not plan["A"] and not plan["B"] and not crit and clean and clean["st"]:
         # состояние телефона оценить не из чего, но продать дороже исправного он не сможет: считаем только верхнюю границу
-        plan["upper"] = deal_calc(rnd5(clean["st"]["q1"]), rnd5(clean["st"]["med"]), price, None, (), reserve_on)
+        plan["upper"] = deal_calc(floor5(clean["st"]["q1"]), rnd5(clean["st"]["med"]), price, None, (), reserve_on)
     best = None
     if plan["A"]:
         best = "A"
@@ -2107,6 +2512,12 @@ def _source_conf(res, facts, plan, clean, pool, st, snap, sev):
             conf = "средняя"
     if not facts["mem"]:
         why.append("память не указана")
+    if facts.get("conflicts"):  # противоречия в характеристиках: уверенного вывода не даём
+        why.append("противоречие: " + facts["conflicts"][0])
+        conf = "низкая"
+    if facts.get("price_unverified"):  # цена только из поиска, со страницей не сверена — уверенного вывода не даём
+        why.append("цена не сверена со страницей объявления")
+        conf = "низкая"
     if res.get("stale"):
         why.append("аналоги не обновлялись давно")
     if best == "B" and plan["B"] and not plan["B"]["final"]:
@@ -2129,6 +2540,8 @@ def _appraise(ad, facts, now=None):
             res["status"], res["no_market_reason"] = "no_market", why
             return res
         res["age_h"], res["stale"] = (age / 3600 if age is not None else None), stale
+        res["db_comps"] = RUN.get("db_comps", 0)
+        res["history"] = mdb_history(market_key(facts["label"]), facts["mem"], now)  # отдельно: в расчёт не входит
         ad_id = int(ad["ad_id"])
         price, sev = facts["price"], max_severity(facts["defects"])
         if facts["label"] == "iPhone SE":  # поколение не указано — цены поколений сильно отличаются
@@ -2411,6 +2824,7 @@ PHOTO_WHY = {
     "error": "нейросеть не приняла запрос с фото",
     "llm_off": "нейросеть недоступна (лимит запросов или сбой сервиса)",
     "none": "анализ не запускался",
+    "no_time": "не хватило времени до конца окна свежести",
 }
 
 
@@ -2561,6 +2975,10 @@ def market_block(facts, ap, compact=False):
             out.append(f"   ({snap['undefined']} объявлений из старого кеша без вида дефекта в расчёт категорий не вошли)")
         if ap.get("stale") and ap.get("age_h") is not None:
             out.append(f"   ⚠ аналоги обновлялись {ap['age_h']:.0f} ч назад (свежие загрузить не удалось)")
+        h = ap.get("history")
+        if h:
+            out.append(f"   История (уже неактивные предложения, в расчёт не входят): {h['n']} шт., медиана {money(h['med'])} BYN"
+                       + (f", у {h['changed']} цена менялась" if h["changed"] else "") + ".")
     return out
 
 
@@ -2752,8 +3170,8 @@ def comp_title_text(ap):
     return "Сопоставимые активные объявления (не сделки):"
 
 
-def build_message(ad, facts, ap):
-    """Сообщение в Telegram (HTML, до ~3990 символов): 📱 💰 / 🔍 Состояние / 📊 Рынок / 💵 Вариант 1 / 🔧 Вариант 2 / ⚠️ Риски / ✅ Итог.
+def build_full_message(ad, facts, ap):
+    """Подробный разбор (MESSAGE_STYLE=full, до ~3990 символов): 📱 💰 / 🔍 Состояние / 📊 Рынок / 💵 Вариант 1 / 🔧 Вариант 2 / ⚠️ Риски / ✅ Итог.
     Только известные факты; неизвестное названо «не указано» / «не подтверждено». Если не помещается — сначала сокращаются
     второстепенные строки, затем убираются примеры аналогов, и только потом режется середина (итог и ссылка остаются всегда)."""
     e = html.escape
@@ -2791,9 +3209,590 @@ def build_message(ad, facts, ap):
     return text[:3990]
 
 
+# ---------- Короткое сообщение (по умолчанию) ----------
+# За несколько секунд понять, открывать ли объявление: модель и цена, рынок, уровни покупки, прибыль, один вердикт
+# (ВЫГОДНО / НЕВЫГОДНО / НЕДОСТАТОЧНО ДАННЫХ) с уверенностью и числом аналогов. Описание продавца не пересказывается;
+# неизвестное не прячется: неизвестный ремонт, противоречия и подозрительно низкая цена — одной строкой.
+
+def _crit(facts):
+    return [n for c, n in facts["defects"].items() if SEVERITY.get(c, 0) >= 3]
+
+
+def _shown_variant(ap):
+    """Какой вариант сделки показывать: лучший из посчитанных; если у ремонта неизвестна цена, а «как есть» посчитан — его."""
+    plan = ap.get("plan") or {}
+    best = plan.get("best")
+    if best == "B" and plan.get("B") and not plan["B"]["final"] and plan.get("A"):
+        best = "A"
+    return best, (plan.get(best) if best else None)
+
+
+def short_reason(facts, ap):
+    """Почему решения нет — конкретно и коротко."""
+    st, plan = ap.get("status"), ap.get("plan") or {}
+    if facts.get("model_conflict"):
+        return "модель не подтверждена: " + (facts.get("conflicts") or ["противоречие в названии"])[0]
+    if st == "no_model":
+        return "модель не определена"
+    if st == "se_gen":
+        return "у iPhone SE не указано поколение, а цены поколений сильно разные"
+    if st == "no_market":
+        return "аналоги не загружены (Куфар не ответил), оценка появится позже"
+    if st == "error":
+        return "внутренняя ошибка расчёта"
+    if st == "few":
+        return f"недостаточно аналогов: найдено {ap.get('found', 0)}, нужно хотя бы {REF_MIN}"
+    if not facts["price"]:
+        return "цена не указана — нужно уточнить у продавца"
+    if ap.get("thin"):
+        return f"недостаточно аналогов: {(ap.get('stats') or {}).get('n', 0)}, нужно хотя бы {MIN_COMPS}"
+    _b, c = _shown_variant(ap)
+    if c and not c["final"]:
+        return f"неизвестна цена ремонта ({', '.join(c['rep_unknown'])})"
+    if not c and not plan.get("upper"):
+        return no_estimate_reason(facts, ap)
+    _code, text = ap.get("decision") or decide(facts, ap)
+    return text.partition(" — ")[2].rstrip(".") or "данных мало"
+
+
+def short_verdict(facts, ap):
+    """(значок, ВЕРДИКТ, пояснение). Только три вердикта; «покупать после торга» = НЕВЫГОДНО по текущей цене + цель торга."""
+    code, _text = ap.get("decision") or decide(facts, ap)
+    price, conf = facts["price"], ap.get("conf")
+    plan = ap.get("plan") or {}
+    _best, c = _shown_variant(ap)
+    crit = _crit(facts)
+    if crit:
+        return "🔴", "НЕВЫГОДНО", f"{', '.join(crit)}: исход ремонта и цена продажи непредсказуемы."
+    if code == "skip":
+        ref = c or plan.get("upper")
+        if ref and price:
+            lim = max(0, ref["limit"])
+            tail = " (даже если продать как исправный)" if not c else ""
+            if lim <= 0:
+                return "🔴", "НЕВЫГОДНО", f"Продавец просит {money(price)} BYN, а с учётом расходов и прибыли сделка не окупается ни при какой цене{tail}."
+            return "🔴", "НЕВЫГОДНО", f"Продавец просит {money(price)} BYN, максимальная покупка для перепродажи — {money(lim)} BYN{tail}."
+        return "🔴", "НЕВЫГОДНО", short_reason(facts, ap)
+    if code == "buy":
+        if conf == "низкая":
+            why = "; ".join(ap.get("conf_why") or []) or "мало данных"
+            return "⚪", "НЕДОСТАТОЧНО ДАННЫХ", f"по расчёту выгодно ({money(price)} ≤ {money(c['limit'])} BYN), но оценка ненадёжна: {why}."
+        return "✅", "ВЫГОДНО", ""
+    if code == "bargain" and c and price:
+        if price > c["limit"]:
+            if not c["final"]:
+                return "🔴", "НЕВЫГОДНО по текущей цене", (f"Максимум {money(max(0, c['limit']))} BYN ещё до ремонта "
+                                                         f"({', '.join(c['rep_unknown'])} — цена не известна), просят {money(price)} BYN.")
+            return "🔴", "НЕВЫГОДНО по текущей цене", f"Станет выгодно, если сторговаться до {money(c['limit'])} BYN (сейчас {money(price)} BYN)."
+        return "⚪", "НЕДОСТАТОЧНО ДАННЫХ", f"цена в пределах максимума, но оценка ненадёжна — торгуйся до {money(c['desired'])} BYN."
+    return "⚪", "НЕДОСТАТОЧНО ДАННЫХ", short_reason(facts, ap)
+
+
+def short_risk(facts, ap):
+    """Одна строка о риске, который способен полностью изменить расчёт (или None)."""
+    e = html.escape
+    pc = facts.get("price_conflict")
+    if pc:
+        was = f"{money(pc['search'])} BYN" if pc["search"] else "без цены"
+        now_ = f"{money(pc['card'])} BYN" if pc["card"] else "без цены"
+        return f"⚠️ Цена в поиске {was}, на странице объявления — {now_}: расчёт по цене страницы, сверь перед покупкой."
+    if facts.get("price_card_invalid"):
+        return (f"⚠️ В карточке объявления нет действительной цены, цена {money(facts['price'])} BYN взята из поиска и не подтверждена"
+                " — уточни у продавца.")
+    if facts.get("price_src") != PRICE_SRC_CARD and (ap.get("status") == "ok" or facts.get("price_unverified")):
+        return "⚠️ Цена и описание не сверены с карточкой объявления (взяты из поиска) — открой его перед решением."
+    if facts.get("conflicts") and not facts.get("model_conflict"):
+        return "⚠️ Противоречие: " + e(facts["conflicts"][0]) + " — уверенность снижена."
+    ph = facts.get("photo") or {}
+    if ph.get("status") == "analyzed" and ph.get("mismatch"):
+        return "⚠️ Фото расходится с описанием: " + e(ph["mismatch"])
+    clean_st = (ap.get("clean") or {}).get("st")
+    if facts["price"] and clean_st and facts["price"] < 0.5 * clean_st["med"] and max_severity(facts["defects"]) < 2:
+        return "⚠️ Цена вдвое ниже рынка — проверь блокировку iCloud/аккаунта и продавца."
+    if ap.get("status") == "ok" and not facts["desc"]:
+        return "⚠️ Описания нет — дефекты могли не указать, открой объявление."
+    return None
+
+
+def _profit_text(lo, hi):
+    if lo >= 0:
+        return f"около {rng(lo, hi)} BYN"
+    return f"от {signed(lo)} до {signed(hi)} BYN"
+
+
+def build_short_message(ad, facts, ap):
+    """📱 модель · 💰 цена продавца · 📍 регион / 📊 перепродажа · ⚡ быстрая продажа · 💸 максимум · 🎯 желательно · 📈 прибыль /
+    вердикт (ВЫГОДНО / НЕВЫГОДНО / НЕДОСТАТОЧНО ДАННЫХ) · уверенность · одно предупреждение · ссылка."""
+    e = html.escape
+    price = facts["price"]
+    head = facts["label"] if facts["label"] != "Другое" else (ad.get("subject") if isinstance(ad.get("subject"), str) else "") or "Телефон"
+    if facts["label"] != "Другое" and facts["mem"]:
+        head += f" {facts['mem']} ГБ"
+    cur = ""
+    usd = price_usd(ad)
+    if facts.get("currency") == "USD" and usd:
+        cur = f" (продавец указал цену в $: {money(usd)})"  # страница показывает рубли по курсу Куфара — их и считаем
+    lines = [f"📱 <b>{e(head)}</b>",
+             "💰 Цена продавца: " + (f"{money(price)} BYN{cur}" if price else "не указана — нужно уточнить"),
+             f"📍 {e(facts['region'] or 'регион не указан')}" + (" · магазин" if facts["seller"] == "магазин" else "")]
+    defects = [n for _c, n in sorted(facts["defects"].items(), key=lambda kv: -SEVERITY.get(kv[0], 0)) if SEVERITY.get(_c, 0) >= 1]
+    if defects:
+        lines.append("🔧 По описанию: " + e("; ".join(defects[:3])))
+    best, c = _shown_variant(ap)
+    plan = ap.get("plan") or {}
+    if ap.get("status") == "ok" and c:
+        after = " после ремонта" if best == "B" else ""
+        # верхняя граница — верхняя четверть цен ТЕХ ЖЕ аналогов, по которым посчитан показанный вариант (у расчёта между
+        # категориями своих аналогов нет — показываем одно число)
+        src_st = ((ap.get("clean") or {}).get("st") if best == "B" else (plan.get("asis") or {}).get("st")) or {}
+        hi = rnd5(src_st["q3"]) if src_st.get("q3") and rnd5(src_st["q3"]) > c["list"] else c["list"]
+        lines += ["", f"📊 Перепродажа{after}: {rng(c['list'], hi)} BYN", f"⚡ Быстрая продажа: около {money(c['quick'])} BYN"]
+        if c["limit"] <= 0:
+            lines.append("💸 Максимум покупки: не окупается при любой цене")
+        else:
+            lines.append(f"💸 Максимум покупки: {money(c['limit'])} BYN" + (" (до ремонта)" if not c["final"] else ""))
+            lines.append(f"🎯 Желательно купить за: {money(max(0, c['desired']))} BYN")
+        if price and "profit" in c:
+            lo, hi_p = sorted((c["profit"], c["profit_opt"]))
+            roi = ""
+            if c.get("roi") is not None and c.get("roi_opt") is not None:
+                r_lo, r_hi = sorted((c["roi"] * 100, c["roi_opt"] * 100))
+                roi = f" (ROI {r_lo:+.0f}…{r_hi:+.0f}%)".replace("-", "−")
+            lines.append(f"📈 Прибыль после расходов: {_profit_text(lo, hi_p)}{roi}" + (" — до вычета ремонта" if not c["final"] else ""))
+        elif not price:
+            lines.append("📈 Прибыль: цену нужно уточнить")
+        rp = plan.get("repair") or {}
+        be = plan.get("breakeven")
+        if rp.get("unknown") and be is not None and best == "A":
+            lines.append(f"🔧 Ремонт ({e(', '.join(rp['unknown']))}) имеет смысл, если обойдётся не дороже ≈ {money(max(0, be))} BYN")
+        elif c and not c["final"] and price and c["limit"] > price:
+            room = floor5((c["limit"] - price) / (1 + REPAIR_OVERRUN_PCT / 100))
+            lines.append(f"🔧 Ремонт ({e(', '.join(c['rep_unknown']))}) должен уложиться в ≈ {money(room)} BYN")
+    icon, verdict, why = short_verdict(facts, ap)
+    lines.append("")
+    if verdict == "ВЫГОДНО":
+        cond = ", если дефекты не обнаружатся" if (plan.get("unconfirmed") or not facts["desc"]) else ""
+        lines.append(f"{icon} <b>{verdict}</b>{cond}")
+    else:
+        lines.append(f"{icon} <b>{verdict}</b>")
+        if why:
+            lines.append(("Причина: " if verdict.startswith("НЕДОСТАТОЧНО") else "") + e(why[:1].upper() + why[1:] if verdict.startswith("НЕВЫГОДНО") else why))
+    st = ap.get("stats") or {}
+    if ap.get("conf") and st.get("n") and not _crit(facts):  # при критичном дефекте аналоги исправных к решению отношения не имеют
+        approx = ""
+        asis = plan.get("asis") or {}
+        if asis.get("src") in ("cat", "interp") and best == "A":
+            approx = ", расчёт приблизительный"
+        lines.append(f"Уверенность: {ap['conf']} · {n_comps(st['n'])} (цены объявлений, не сделок{approx}).")
+    risk = short_risk(facts, ap)
+    if risk:
+        lines.append(risk)
+    lines += ["", "🔗 " + e(ad.get("ad_link") if isinstance(ad.get("ad_link"), str) and ad.get("ad_link") else item_url(ad["ad_id"]))]
+    return "\n".join(lines)
+
+
+def n_comps(n):
+    return f"{n} {_ads_form(n, 'сопоставимое объявление', 'сопоставимых объявления', 'сопоставимых объявлений')}"
+
+
+def build_message(ad, facts, ap):
+    """Сообщение в Telegram: короткое (по умолчанию) или подробное (MESSAGE_STYLE=full)."""
+    if MESSAGE_STYLE == "full":
+        return build_full_message(ad, facts, ap)
+    return build_short_message(ad, facts, ap)
+
+
+# ---------- База рынка: market_history.json ----------
+# Постоянная база НАБЛЮДЕНИЙ (не «обучение» нейросети): каждое увиденное объявление нужной модели — одна запись по номеру, повторное
+# появление обновляет её. Используется для аналогов в оценке (вместе со свежей выдачей) и как журнал уведомлений.
+# В записи только то, что действительно получено, с источником: «текст продавца», «параметры Куфара», «фото (нейросеть)».
+# Исчезновение из выдачи не значит «продано»: такая запись получает статус not_seen («не видно в выдаче»), не «sold».
+# Файл пишется по одной записи на строку и с сортировкой — так коммиты в git маленькие (меняются только строки изменённых записей).
+
+MARKET_DB_FILE = Path(__file__).with_name("market_history.json")
+MDB = {"ok": True, "loaded": 0, "why": "", "data": {"version": 1, "ads": {}}}
+MDB_TOUCH_S = 6 * 3600  # last_seen у неизменившихся записей обновляется не чаще раза в 6 часов (маленькие коммиты)
+
+
+def _iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def mdb_reset():
+    MDB.update(ok=True, loaded=0, why="", data={"version": 1, "ads": {}})
+
+
+def mdb_load():
+    """Читает базу. Нет файла — пустая база. Файл повреждён — база выключается на этот запуск: файл НЕ перезаписывается
+    (восстановить можно из истории git), уведомления продолжают работать по seen.json."""
+    mdb_reset()
+    try:
+        text = MARKET_DB_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        MDB.update(ok=False, why=f"не читается: {e}")
+        log("База рынка не читается, в этом запуске не сохраняю её:", e)
+        return False
+    try:
+        data = json.loads(text)
+        if not isinstance(data, dict) or not isinstance(data.get("ads"), dict):
+            raise ValueError("нет раздела ads")
+    except Exception as e:
+        MDB.update(ok=False, why=f"повреждена: {e}")
+        log(f"База рынка {MARKET_DB_FILE.name} повреждена ({e}) — файл не трогаю и в этом запуске не перезаписываю. "
+            "Восстанови прошлую версию из истории git.")
+        return False
+    data["ads"] = {k: v for k, v in data["ads"].items() if isinstance(v, dict)}
+    MDB["data"], MDB["loaded"] = data, len(data["ads"])
+    return True
+
+
+def _mdb_ads():
+    return MDB["data"].setdefault("ads", {})
+
+
+def mdb_first_lt(ad_id):
+    """Самый ранний list_time, который база видела у этого объявления (unix-время) или None."""
+    rec = _mdb_ads().get(str(ad_id))
+    if not rec:
+        return None
+    vals = [parse_list_time(x) for x in [rec.get("list_time")] + list(rec.get("list_time_hist") or [])]
+    vals = [v for v in vals if v is not None]
+    return min(vals) if vals else None
+
+
+def price_hist_norm(hist):
+    """История цены в формате [время, цена, источник]. Старые записи [время, цена] — наблюдения выдачи."""
+    out = []
+    for h in hist or []:
+        if isinstance(h, list) and len(h) in (2, 3) and isinstance(h[1], (int, float)) and not isinstance(h[1], bool):
+            out.append([h[0], h[1], h[2] if len(h) == 3 and h[2] in ("search", "card") else "search"])
+    return out
+
+
+def price_current(hist):
+    """(текущая цена, источник). Карточка (цена страницы) в приоритете; выдача — только если ЕЁ значение изменилось позже
+    последнего наблюдения карточки (значит, продавец снова поменял цену, а карточку с тех пор не смотрели)."""
+    last = {}
+    for h in hist:
+        last[h[2]] = h
+    c, srch = last.get("card"), last.get("search")
+    if c and (not srch or c[0] >= srch[0]):
+        return c[1], "card"
+    if srch:
+        return srch[1], "search"
+    return None, None
+
+
+def price_changes(hist):
+    """Сколько раз цена действительно менялась: смены значения внутри каждого источника (выдача с выдачей, карточка с карточкой)."""
+    hist = price_hist_norm(hist)
+    return sum(max(0, sum(1 for h in hist if h[2] == src_) - 1) for src_ in ("search", "card"))
+
+
+def mdb_observe(ad, comp=None, key=None, facts=None, now=None, checked=False):
+    """Добавляет или обновляет запись об объявлении. Ничего не придумывает: пустое поле не записывается, факты из описания
+    заменяются только новым описанием (выдача без описания их не стирает). Ошибки не выходят наружу."""
+    try:
+        return _mdb_observe(ad, comp, key, facts, now, checked)
+    except Exception as e:
+        log("База рынка: не удалось записать наблюдение:", (ad or {}).get("ad_id") if isinstance(ad, dict) else None, e)
+        return None
+
+
+def _mdb_observe(ad, comp, key, facts, now, checked):
+    if not isinstance(ad, dict):
+        return None
+    try:
+        ad_id = int(ad.get("ad_id"))
+    except (TypeError, ValueError):
+        return None
+    now = int(now or time.time())
+    ads = _mdb_ads()
+    rec = ads.get(str(ad_id))
+    new = rec is None
+    if new:
+        rec = {"first_seen": now}
+    changed = new
+    title = ad.get("subject") if isinstance(ad.get("subject"), str) else ""
+    link = ad.get("ad_link") if isinstance(ad.get("ad_link"), str) and ad.get("ad_link") else item_url(ad_id)
+    rec["url"], rec["title"] = link, title[:120]
+    price = price_byn(ad)
+    src = "card" if ad.get("_price_src") == PRICE_SRC_CARD else "search"
+    # исходные поля цены — отдельно по источникам (старый плоский формат price_raw был наблюдением выдачи)
+    pr = rec.get("price_raw") if isinstance(rec.get("price_raw"), dict) else {}
+    if pr and not ({"search", "card"} & set(pr)):
+        pr = {"search": pr}
+    raw = {k: ad.get(k) for k in ("price_byn", "price_usd", "currency") if isinstance(ad.get(k), (str, int, float)) and not isinstance(ad.get(k), bool)}
+    if "_price_raw_search" in ad:  # карточку применили поверх выдачи: исходное значение выдачи тоже сохраняем
+        pr["search"] = dict(pr.get("search") or {}, price_byn=ad["_price_raw_search"])
+    if "_price_raw_card" in ad:
+        pr["card"] = dict(pr.get("card") or {}, price_byn=ad["_price_raw_card"])
+    if raw:
+        pr[src] = dict(pr.get(src) or {}, **raw)
+    if pr:
+        rec["price_raw"] = pr
+    # история: [время, цена, источник]. Изменение = смена значения ВНУТРИ одного источника (сопоставимые наблюдения);
+    # расхождение выдачи и карточки — не изменение цены, оно пишется отдельно в price_conflict
+    hist = price_hist_norm(rec.get("price_hist"))
+    if price > 0:  # наблюдение без действительной цены не затирает известную цену и не считается её изменением
+        same = [h for h in hist if h[2] == src]
+        if not same or same[-1][1] != price:
+            hist.append([now, price, src])
+            changed = True
+    if hist:
+        rec["price_hist"] = hist[-16:]
+    cur_price, cur_src = price_current(hist)
+    rec["price_byn"] = cur_price
+    if cur_src:
+        rec["price_src"] = "карточка" if cur_src == "card" else "выдача"
+    if ad.get("_price_conflict"):  # выдача и карточка расходились: храним обе цифры с датой
+        pc = ad["_price_conflict"]
+        rec["price_conflict"] = {"search": pc["search"], "card": pc["card"], "t": now}
+    if "_price_card_invalid" in ad:  # в карточке недействительная цена: храним, что пришло, цену выдачи не подтверждаем
+        rec["price_card_invalid"] = {"raw": ad["_price_card_invalid"], "t": now}
+    if isinstance(ad.get("currency"), str):
+        rec["currency"] = ad["currency"]
+    lt = parse_list_time(ad.get("list_time"))
+    if lt is not None:
+        iso = _iso(lt)
+        old = rec.get("list_time")
+        if old and old != iso:
+            lh = [x for x in (rec.get("list_time_hist") or []) if isinstance(x, str)]
+            if old not in lh:
+                lh.append(old)
+            rec["list_time_hist"] = lh[-5:]
+            changed = True
+        rec["list_time"] = iso
+    elif ad.get("list_time") not in (None, ""):
+        rec["list_time_raw"] = str(ad.get("list_time"))[:40]  # дата пришла, но не разобралась — храним как есть
+    if facts is None:
+        try:
+            facts = rule_facts(ad)
+        except Exception:
+            facts = None
+    if facts:
+        rec["model"] = {"label": facts["label"], "conf": facts.get("model_conf"), "src": facts.get("model_src")}
+        if facts["mem"]:
+            rec["mem_gb"], rec["mem_src"] = facts["mem"], facts.get("mem_src") or "текст"
+        for k_, v_ in (("region", facts["region"]), ("area", facts["area"]), ("seller", facts["seller"]),
+                       ("condition", param(ad, "condition"))):
+            if v_:
+                rec[k_] = v_
+        if facts["desc"] or "defects" not in rec:  # факты из текста: описание надёжнее одного заголовка
+            if facts["defects"]:
+                rec["defects"], rec["defects_src"] = dict(facts["defects"]), "текст продавца"
+            elif facts["desc"]:
+                rec.pop("defects", None)
+                rec["defects_src"] = "текст продавца: дефекты не названы (это не подтверждение исправности)"
+            if facts["battery_pct"] is not None:
+                rec["battery"] = {"pct": facts["battery_pct"], "src": "текст продавца"}
+            elif facts["desc"]:
+                rec.pop("battery", None)
+            kit = [x for x in facts["kit"] if x != "только телефон"]
+            if kit:
+                rec["kit"] = {"items": kit, "src": "текст продавца", "photo_confirmed": False}
+            if facts.get("conflicts"):
+                rec["conflicts"] = list(facts["conflicts"])
+            else:
+                rec.pop("conflicts", None)
+            rec["has_desc"] = bool(facts["desc"]) or rec.get("has_desc", False)
+        if comp is None and facts["label"] != "Другое":
+            try:
+                k2 = market_key(facts["label"])
+                comp, key = comp_item(ad, k2), k2
+            except Exception:
+                comp = None
+    if comp:
+        new_comp = [int(round(rec["price_byn"])) if rec.get("price_byn") else comp[1], comp[2], comp[3], comp[4], comp[5]]
+        if rec.get("comp") != new_comp:
+            changed = True
+        rec["comp"], rec["key"] = new_comp, key
+    if changed or checked or now - int(rec.get("last_seen") or 0) >= MDB_TOUCH_S:
+        rec["last_seen"] = now
+    if checked:
+        rec["last_check"] = now
+    ads[str(ad_id)] = rec
+    return rec
+
+
+def mdb_note(ad_id, status, why="", now=None):
+    """Отметка об уведомлении: sent (отправлено), expired (устарело к отправке), failed (Telegram не принял), skipped (не свежее)."""
+    rec = _mdb_ads().setdefault(str(ad_id), {"first_seen": int(now or time.time()), "url": item_url(ad_id)})
+    rec["notify"] = {"status": status, "t": int(now or time.time()), **({"why": why[:120]} if why else {})}
+
+
+def mdb_notified(ad_id):
+    rec = _mdb_ads().get(str(ad_id)) or {}
+    return (rec.get("notify") or {}).get("status") == "sent"
+
+
+def mdb_appraisal(ad_id, facts, ap, now=None):
+    """Результат оценки (последние 3): вердикт, уровни цены, на скольких и каких аналогах посчитано."""
+    try:
+        rec = _mdb_ads().get(str(ad_id))
+        if rec is None:
+            return
+        plan = ap.get("plan") or {}
+        c = plan.get(plan.get("best")) if plan.get("best") else None
+        st = ap.get("stats") or {}
+        row = {"t": int(now or time.time()), "verdict": (ap.get("decision") or ("unknown", ""))[0], "status": ap.get("status"),
+               "conf": ap.get("conf"), "n": st.get("n", 0), "db_comps": ap.get("db_comps", 0),
+               "comps": [it[0] for it in (ap.get("comps") or [])][:5]}
+        if ap.get("history"):  # прошлые (неактивные) предложения — отдельно от текущей оценки
+            row["history"] = {k_: ap["history"][k_] for k_ in ("n", "med", "changed")}
+        if c:
+            row.update(max_buy=c["limit"], desired=c["desired"], quick=c["quick"], resale=c["list"])
+        if facts.get("price"):
+            row["price"] = facts["price"]
+        rec["appraisals"] = ((rec.get("appraisals") or []) + [row])[-3:]
+        ph = facts.get("photo") or {}
+        if ph.get("status") == "analyzed":  # только если запрос к нейросети с фото действительно состоялся
+            rec["photo"] = {"t": int(now or time.time()), "n": ph.get("n", 0), "src": "фото (нейросеть), не проверка",
+                            "findings": [{"what": f["what"], "conf": f["conf"]} for f in ph.get("findings") or []][:4],
+                            "kit_visible": list(ph.get("kit") or [])}
+            if rec.get("kit") and ph.get("kit"):
+                rec["kit"]["photo_confirmed"] = True
+    except Exception as e:
+        log("База рынка: не удалось записать оценку:", ad_id, e)
+
+
+def mdb_is_active(rec, now=None):
+    """Активное = объявление видели в выдаче не позже MARKET_ACTIVE_DAYS дней назад. Наличие записи в базе активности не означает.
+    Исчезновение из выдачи не значит «продано»: такая запись просто перестаёт быть текущим предложением."""
+    return (now or time.time()) - int(rec.get("last_seen") or 0) <= MARKET_ACTIVE_DAYS * 86400
+
+
+def _comp_row(k_, rec):
+    c = rec.get("comp")
+    if not isinstance(c, list) or len(c) != 5:
+        return None
+    try:
+        if not c[0] or c[0] <= 0:
+            return None
+        return [int(k_), int(c[0]), int(c[1] or 0), int(c[2] or 0), int(c[3] or 0), int(c[4] or 0), title_key(rec.get("title") or "")]
+    except (TypeError, ValueError):
+        return None
+
+
+def mdb_comps(key, now=None):
+    """ТЕКУЩИЕ аналоги из базы: та же модель, активная запись (видели в выдаче не позже MARKET_ACTIVE_DAYS), действительная
+    последняя цена, без противоречий в характеристиках. Давно не встречавшиеся записи сюда не попадают — даже если аналогов мало:
+    тогда честно падает уверенность, а выборка не раздувается устаревшими ценами."""
+    if not key:
+        return []
+    out = []
+    for k_, rec in _mdb_ads().items():
+        if rec.get("key") != key or rec.get("conflicts") or not mdb_is_active(rec, now):
+            continue
+        row = _comp_row(k_, rec)
+        if row:
+            out.append(row)
+    return out
+
+
+def mdb_history(key, mem=0, now=None):
+    """ИСТОРИЧЕСКАЯ сводка (отдельно от текущей оценки): записи той же модели (и памяти, если известна), которые уже не активны,
+    но видны в базе. Это прошлые цены предложений: для анализа изменения цен, а не для максимума покупки.
+    {n, med, min, max, changed (у скольких цена менялась)} или None."""
+    if not key:
+        return None
+    prices, changed = [], 0
+    for k_, rec in _mdb_ads().items():
+        if rec.get("key") != key or rec.get("conflicts") or mdb_is_active(rec, now):
+            continue
+        row = _comp_row(k_, rec)
+        if not row or (mem and row[2] and row[2] != mem) or row[3] & (F_DEF | F_PARTS):
+            continue
+        prices.append(row[1])
+        changed += price_changes(rec.get("price_hist")) > 0
+    if not prices:
+        return None
+    return {"n": len(prices), "med": statistics.median(prices), "min": min(prices), "max": max(prices), "changed": changed}
+
+
+def _mdb_status(rec, now):
+    rec["status"] = "active" if mdb_is_active(rec, now) else "not_seen"
+    flags = []
+    if price_changes(rec.get("price_hist")):
+        flags.append("price_changed")
+    if rec.get("price_conflict") or rec.get("price_card_invalid"):
+        flags.append("price_sources_differ")  # выдача и карточка расходились — это не изменение цены
+    if not rec.get("defects") and not rec.get("has_desc"):
+        flags.append("condition_unconfirmed")
+    if rec.get("list_time_hist"):
+        flags.append("relisted")
+    if flags:
+        rec["flags"] = flags
+    else:
+        rec.pop("flags", None)
+
+
+def mdb_prune(now=None):
+    """Удаляет только то, что безопасно: записи, не появлявшиеся в выдаче MARKET_DB_DAYS дней (кроме отправленных за последние
+    30 дней — они нужны против повторов), и при переполнении — тех, кого дольше всего не видели."""
+    now = int(now or time.time())
+    ads = _mdb_ads()
+    keep_sent = now - 30 * 86400
+
+    def protected(rec):
+        n = rec.get("notify") or {}
+        return n.get("status") == "sent" and int(n.get("t") or 0) >= keep_sent
+
+    old = now - MARKET_DB_DAYS * 86400
+    for k_ in [k_ for k_, r in ads.items() if int(r.get("last_seen") or r.get("first_seen") or 0) < old and not protected(r)]:
+        del ads[k_]
+    if len(ads) > MARKET_DB_MAX:
+        victims = sorted((int(r.get("last_seen") or 0), k_) for k_, r in ads.items() if not protected(r))
+        for _t, k_ in victims[:len(ads) - MARKET_DB_MAX]:
+            del ads[k_]
+
+
+def mdb_save(now=None):
+    """Атомарная запись: временный файл → проверка, что он читается → замена. Возвращает True при успехе.
+    Не пишет: в тестовом запуске; если база при загрузке оказалась повреждённой; если в памяти записей вдвое меньше, чем
+    было загружено (это похоже на ошибку, а не на очистку). Ошибка записи не роняет запуск: уведомления хранятся в seen.json."""
+    if DRY_RUN:
+        return False
+    if not MDB["ok"]:
+        log(f"База рынка не сохранена: {MDB['why']}")
+        return False
+    now = int(now or time.time())
+    ads = _mdb_ads()
+    if MDB["loaded"] >= 100 and len(ads) < MDB["loaded"] * 0.5:
+        log(f"База рынка не сохранена: в памяти {len(ads)} записей, а загружено было {MDB['loaded']} — похоже на ошибку")
+        return False
+    tmp = MARKET_DB_FILE.with_name(MARKET_DB_FILE.name + ".tmp")
+    try:
+        mdb_prune(now)
+        for rec in ads.values():
+            _mdb_status(rec, now)
+        head = {k: v for k, v in MDB["data"].items() if k != "ads"}
+        head.update(version=1, updated=_iso(now), count=len(ads),
+                    note="Наблюдения за объявлениями Куфара: цены объявлений (не сделок). Статус not_seen — не видно в выдаче, не «продано».")
+        lines = [f'"{k_}":' + json.dumps(ads[k_], ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                 for k_ in sorted(ads, key=lambda x: (len(x), x))]
+        text = json.dumps(head, ensure_ascii=False, separators=(",", ":"), sort_keys=True)[:-1] + ',"ads":{\n' + ",\n".join(lines) + "\n}}\n"
+        tmp.write_text(text, encoding="utf-8")
+        check = json.loads(tmp.read_text(encoding="utf-8"))
+        if len(check.get("ads") or {}) != len(ads):
+            raise ValueError("записанный файл не совпадает с базой в памяти")
+        os.replace(tmp, MARKET_DB_FILE)
+        MDB["loaded"] = len(ads)
+        return True
+    except Exception as e:
+        log("База рынка не сохранена (ошибка записи), прежний файл не тронут:", e)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
 # ---------- Основной цикл ----------
 
-SEEN_MAX = max(1, int(_env_float("SEEN_MAX", 10000)))  # сколько id объявлений помнить; вытесняются те, кого дольше всего не видели
+SEEN_MAX =max(1, int(_env_float("SEEN_MAX", 10000)))  # сколько id объявлений помнить; вытесняются те, кого дольше всего не видели
 
 
 class Seen(set):
@@ -2859,6 +3858,10 @@ def load_seen():
     STATE["notice"] = int(data.get("notice") or 0)
     pending = data.get("pending")
     STATE["pending"] = pending if isinstance(pending, dict) else {}
+    marks = data.get("marks")
+    STATE["marks"] = {str(b): [int(v[0]), int(v[1])] for b, v in marks.items()
+                      if str(b).isdigit() and isinstance(v, list) and len(v) == 2
+                      and all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in v)} if isinstance(marks, dict) else {}
     # При переходе со старого формата объявления из HISTORY тоже считаем уже обработанными,
     # кроме объявлений, которые явно ожидают повторной отправки.
     if not isinstance(raw, dict):
@@ -2882,13 +3885,15 @@ def save_seen(seen):
     market = {k: v for k, v in STATE["market"].items() if isinstance(v, dict) and v.get("t", 0) > week}
     # Держим не больше SEEN_MAX id; первыми вытесняются те, кого дольше всего не видели.
     newest = sorted(seen.ts.items(), key=lambda kv: kv[1])[-SEEN_MAX:]
+    mark_cut = time.time() - 14 * 86400  # метки номеров нужны только за последние часы; две недели — с запасом
+    marks = {b: v for b, v in sorted(STATE["marks"].items(), key=lambda kv: int(kv[0])) if v[1] >= mark_cut}
     data = {"seen": {str(ad_id): timestamp for ad_id, timestamp in sorted(newest)}, "history": HISTORY, "market": market,
-            "baseline": sorted(set(STATE["baseline"])), "notice": STATE["notice"], "pending": STATE["pending"]}
+            "baseline": sorted(set(STATE["baseline"])), "notice": STATE["notice"], "pending": STATE["pending"], "marks": marks}
     tmp = SEEN_FILE.with_name(SEEN_FILE.name + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
     os.replace(tmp, SEEN_FILE)
 
-_KEEP = ("ad_id", "ad_link", "subject", "type", "company_ad", "price_byn", "price_usd", "body", "body_short")
+_KEEP = ("ad_id", "ad_link", "subject", "type", "company_ad", "price_byn", "price_usd", "body", "body_short", "list_time", "currency")
 
 
 def stash(ad_id, ad):
@@ -2966,150 +3971,334 @@ def send_ad(text):
         return "retry"
 
 
-def process_ad(ad):
-    """Разбор + оценка + сообщение. Возвращает (текст, ok_для_статистики) или (None, False), если это не телефон."""
+def _remaining(fresh_until):
+    return float("inf") if fresh_until is None else fresh_until - time.time()
+
+
+PRICE_SRC_CARD = "карточка объявления (совпадает со страницей Куфара)"
+PRICE_SRC_SEARCH = "поисковая выдача (карточка не получена — с карточкой не сверено)"
+
+
+def apply_card(ad, card):
+    """Сверяет объявление из выдачи с его карточкой. Источник цены — карточка: страница kufar.by/item/… показывает именно её
+    price_byn (проверено на живом объявлении: страница «2 150.29 р.» = price_byn «215029» карточки). Выдача — поисковый индекс,
+    он может отставать после того, как продавец изменил цену. Минимальная из двух цен НЕ выбирается: при расхождении берётся
+    цена страницы, а расхождение записывается (ad["_price_conflict"]) и показывается в сообщении."""
+    if isinstance(card.get("body"), str) and card["body"]:
+        ad["body"] = card["body"]
+    ad["_price_raw_search"] = ad.get("price_byn")  # исходные значения сохраняем как есть, что бы ни случилось дальше
+    if "price_byn" in card:
+        ad["_price_raw_card"] = card.get("price_byn")
+        cp, sp = _kopecks(card.get("price_byn")), price_byn(ad)
+        if cp > 0:  # в карточке действительная цена — это цена страницы
+            if cp != sp:
+                ad["_price_conflict"] = {"search": sp, "card": cp, "search_raw": ad.get("price_byn"), "card_raw": card.get("price_byn")}
+                ad["price_byn_search"], ad["price_byn"] = ad.get("price_byn"), card.get("price_byn")
+                if "price_usd" in card:
+                    ad["price_usd"] = card.get("price_usd")
+            ad["_price_src"] = PRICE_SRC_CARD
+        elif sp > 0:
+            # в карточке цена нулевая, отрицательная или некорректная, а в выдаче — действительная: выдачу НЕ затираем,
+            # но цену и не подтверждаем — неизвестно, «договорная» ли теперь цена или карточка отдала мусор
+            ad["_price_card_invalid"] = card.get("price_byn")
+            ad["_price_src"] = PRICE_SRC_SEARCH
+        else:
+            ad["_price_src"] = PRICE_SRC_CARD  # цены нет ни там, ни там — согласованно «не указана»
+    if isinstance(card.get("currency"), str):
+        ad["currency"] = card["currency"]
+    clt, slt = parse_list_time(card.get("list_time")), parse_list_time(ad.get("list_time"))
+    if clt is not None and slt is not None and abs(clt - slt) >= 1:
+        log(f"list_time в карточке {ad.get('ad_id')} отличается от выдачи: беру более раннее (строже по свежести)")
+        if clt < slt:
+            ad["list_time"] = card.get("list_time")
+
+
+def price_diag(ad, db_rec):
+    """Строка журнала: откуда какая цена пришла (выдача, карточка, база). Только данные объявления — никаких токенов и ключей."""
+    pc = ad.get("_price_conflict") or {}
+    search_raw = ad.get("_price_raw_search", pc.get("search_raw", ad.get("price_byn")))
+    card_raw = ad.get("_price_raw_card", "—")
+    base = "записи нет"
+    if db_rec and db_rec.get("price_byn"):
+        base = f"{db_rec['price_byn']:g} BYN (источник: {db_rec.get('price_src') or 'выдача'})"
+    note = ""
+    if pc:
+        note = " ⚠ ВЫДАЧА И КАРТОЧКА РАСХОДЯТСЯ"
+    elif "_price_card_invalid" in ad:
+        note = (f" ⚠ В КАРТОЧКЕ НЕТ ДЕЙСТВИТЕЛЬНОЙ ЦЕНЫ ({ad['_price_card_invalid']!r}): оставлена цена выдачи, она не подтверждена")
+    return (f"Цена {ad.get('ad_id')}: выдача price_byn={search_raw!r}, карточка price_byn={card_raw!r}, currency={ad.get('currency')!r}, "
+            f"price_usd={ad.get('price_usd')!r}; в базе: {base}; итог {price_byn(ad):g} BYN — {ad.get('_price_src') or PRICE_SRC_SEARCH}"
+            + note)
+
+
+def process_ad(ad, fresh_until=None):
+    """Разбор + оценка + сообщение. Возвращает (текст, ok_для_статистики) или (None, False), если это не телефон.
+    fresh_until — когда объявление перестанет быть свежим: дорогие шаги (карточка, фото, обновление аналогов) пропускаются,
+    если на них уже нет времени, — лучше короткая оценка вовремя, чем полная, но опоздавшая."""
+    RUN["no_photo"] = RUN["no_refresh"] = False
+    RUN["ad_until"] = fresh_until
     try:
-        if not ad_description(ad) and not (RUN["deadline"] and time.time() > RUN["deadline"]):
-            body = fetch_body(ad["ad_id"])
-            if body:
-                ad["body"] = body
+        for key_ in ("_price_conflict", "_price_src", "_price_unverified", "_price_card_invalid", "_price_raw_search", "_price_raw_card"):
+            ad.pop(key_, None)
+        if not (RUN["deadline"] and time.time() > RUN["deadline"]) and _remaining(fresh_until) > 15:
+            card = fetch_card(ad["ad_id"])  # всегда: и описание, и цена со страницы (а не из возможно отставшей выдачи)
+            if card:
+                apply_card(ad, card)
             time.sleep(KUFAR_PAUSE)
+        if ad.get("_price_src") != PRICE_SRC_CARD:
+            ad["_price_unverified"] = True  # карточку не получили (сбой, лимит или не хватило времени): цена только из поиска
+        log(price_diag(ad, _mdb_ads().get(str(ad.get("ad_id")))))
+        RUN["no_photo"] = _remaining(fresh_until) < 40
+        RUN["no_refresh"] = _remaining(fresh_until) < 20
         facts = analyze_ad(ad)
-        raw_price = ad.get("price_byn")
-        if raw_price not in (None, "", 0, "0"):
-            log(f"Цена из выдачи Куфара: ad_id={ad.get('ad_id')}, price_byn_raw={raw_price!r}, распознано={facts['price']:.0f} BYN")
         if not facts["is_phone"]:
             return None, False
         ap = appraise(ad, facts)
+        mdb_observe(ad, facts=facts, checked=True)
+        mdb_appraisal(ad["ad_id"], facts, ap)
         return build_message(ad, facts, ap), not is_suspicious(facts, ap)
     except Exception as e:  # оценка не должна терять объявление: шлём в прежнем формате
         log("Ошибка оценки, шлю обычное сообщение:", e)
         return format_ad(ad, ""), True
+    finally:
+        RUN["no_photo"] = RUN["no_refresh"] = False
+        RUN["ad_until"] = None
+
+
+def candidate_reason(ad_id, ad, seen, prev_lt, now=None):
+    """Почему объявление НЕ кандидат на уведомление ('' — кандидат). Порядок: уже отправлено → дата → поднятие."""
+    if ad_id in seen or mdb_notified(ad_id):
+        return "notified"
+    ok, reason, _age, lt = fresh_status(ad, now)
+    if not ok:
+        return reason
+    if prev_lt is not None and lt - prev_lt > 60:
+        return "republished"  # база уже видела это объявление с более ранней датой: дату обновили, публикация не новая
+    ok, reason = originality(ad_id, lt, STATE["marks"])
+    return "" if ok else reason
+
+
+def log_skips(why):
+    """Журнал: почему объявления не отправлены. Обычные причины — числом, необычные (нет даты, поднятие…) — с номерами."""
+    if not why:
+        return
+    parts = []
+    for reason in ("old", "notified", "no_date", "bad_date", "future", "bumped", "republished", "unconfirmed", "expired"):
+        ids = why.get(reason) or []
+        if not ids:
+            continue
+        txt = f"{SKIP_RU[reason]}: {len(ids)}"
+        if reason not in ("old", "notified"):
+            txt += " (" + ", ".join(str(i) for i in ids[:10]) + ("…" if len(ids) > 10 else "") + ")"
+        parts.append(txt)
+    log("Не отправляю — " + "; ".join(parts))
 
 
 def cycle(seen, first_run):
-    """Один проход. Возвращает (сколько запросов прошло, сколько запускали)."""
+    """Один проход. Возвращает (сколько запросов прошло, сколько запускали).
+    Два независимых процесса: (1) всё увиденное — в базу рынка и метки номеров; (2) уведомления — только свежие публикации
+    (fresh_status + originality), с повторной проверкой возраста прямо перед отправкой."""
     t0 = time.time()
-    RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0, img_fails=0)
+    RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0, img_fails=0, db_comps=0)
     _MARKET_REFRESHES["n"] = 0
     llm_reset()
     queries = list(QUERIES) + pick_extra(t0)
-    base = set() if first_run else set(STATE["baseline"])
-    new_ads, quiet, learned, ok_queries = {}, {}, [], 0
+    found, ok_queries = {}, 0
     for q in queries:
         try:
-            ads = [a for a in fetch(q) if isinstance(a, dict) and a.get("ad_id") is not None]
+            ads = [a for a in fetch_fresh(q, t0) if isinstance(a, dict) and a.get("ad_id") is not None]
         except Exception as e:
             log(f"Ошибка Куфара ({q}):", e)
             continue
         ok_queries += 1
         for a in ads:
-            seen.touch(a["ad_id"])  # объявление ещё есть в выдаче: продлеваем память, чтобы оно не вернулось как «новое»
-        if q in base:
-            new_ads.update({ad["ad_id"]: ad for ad in ads if ad["ad_id"] not in seen})
-        else:  # запрос запускается впервые: то, что уже висит, запоминаем молча, чтобы не завалить чат старым
-            quiet.update({ad["ad_id"]: ad for ad in ads})
-            learned.append(q)
+            try:
+                aid = int(a["ad_id"])
+            except (TypeError, ValueError):
+                continue
+            found.setdefault(aid, a)  # одно объявление в нескольких запросах или на соседних страницах — одна запись
+            seen.touch(aid)
         time.sleep(KUFAR_PAUSE)
-    quiet = {i: a for i, a in quiet.items() if i not in seen and i not in new_ads}
-    if quiet:
-        for ad in quiet.values():
+    marks_add(STATE["marks"], found.values())
+    if ok_queries and not marks_cover(STATE["marks"], time.time()):
+        seed_marks(time.time())  # первый запуск / долгий простой: дочитываем выдачу ради опорных меток (без уведомлений)
+    STATE["baseline"] = sorted(set(STATE["baseline"]) | set(queries))  # для совместимости со старым форматом seen.json
+    now = time.time()
+    cands, why = {}, {}
+    for aid, ad in found.items():
+        try:
+            if not basic_filter(ad):  # не телефон (чехол, планшет и т.п.): в базу не пишем, повторная проверка стоит дёшево
+                continue
+            prev_lt = mdb_first_lt(aid)
+            mdb_observe(ad, now=now)
+            if first_run:  # всё, что уже висит в выдаче в момент первого запуска, — не новинки этого бота: не рассылаем
+                seen.add(aid)  # (в seen.json, а не только в базе: так защита переживёт и повреждение базы)
+                continue
+            reason = candidate_reason(aid, ad, seen, prev_lt, now)
+        except Exception as e:  # одно «ядовитое» объявление не роняет запуск
+            log("Пропускаю странное объявление:", aid, e)
+            continue
+        if reason:
+            why.setdefault(reason, []).append(aid)
+        else:
+            cands[aid] = ad
+    if first_run:
+        log(f"Первый запуск: запомнил {len(found)} объявлений (подходящие — как уже существующие), уведомлений не шлю")
+        return ok_queries, len(queries)
+    # очередь повторов (Telegram не принял): те же правила — устаревшее не отправляем никогда
+    for aid, ad in pending_ads(seen).items():
+        if aid in cands:
+            continue
+        if aid in found:  # уже проверено по свежей выдаче выше и не прошло — из очереди убираем
+            unstash(aid)
+            continue
+        reason = candidate_reason(aid, ad, seen, None, now)
+        if reason:
+            why.setdefault("expired" if reason == "old" else reason, []).append(aid)
+            unstash(aid)
+            if reason == "old":
+                mdb_note(aid, "expired", "из очереди повторов: старше допустимого возраста")
+        else:
+            cands[aid] = ad
+    log_skips(why)
+    if cands:
+        log(f"Свежих публикаций для уведомления: {len(cands)}")
+    # сначала те, у кого меньше всего времени до конца «окна свежести»
+    todo = sorted(cands.items(), key=lambda kv: parse_list_time(kv[1].get("list_time")) or 0)
+    for aid, ad in todo:
+        ok, reason, age, lt = fresh_status(ad)
+        if not ok:  # пока ждали своей очереди, объявление устарело
+            log(f"Не отправляю {aid}: {SKIP_RU.get(reason, reason)}" + (f" ({age:.0f} с)" if age is not None else ""))
+            mdb_note(aid, "expired", f"устарело до разбора: {SKIP_RU.get(reason, reason)}")
+            seen.add(aid)
+            unstash(aid)
+            continue
+        if time.time() > RUN["deadline"]:
+            log("Время запуска вышло — остальное в очередь (уйдёт, только если ещё будет свежим)")
             try:
                 if basic_filter(ad):
-                    seen.add(ad["ad_id"])
-                    record_ad(ad, True)
-            except Exception as e:
-                log("Пропускаю странное объявление:", ad.get("ad_id"), e)
-        log(f"Новые запросы {learned}: запомнил {len(quiet)} существующих объявлений без уведомлений")
-    STATE["baseline"] = sorted(set(STATE["baseline"]) | set(learned))
-    if first_run:
-        return ok_queries, len(queries)
-
-    for ad_id, ad in pending_ads(seen).items():  # то, что не удалось отправить раньше, идёт первым
-        new_ads.setdefault(ad_id, ad)
-    todo = sorted(new_ads.items())
-    for idx, (ad_id, ad) in enumerate(todo):
-        if time.time() > RUN["deadline"]:
-            log("Время запуска вышло — остальное подхвачу в следующий раз")
-            for rest_id, rest_ad in todo[idx:]:  # не потеряем: запомним в очереди повторов
-                try:
-                    if basic_filter(rest_ad):
-                        stash(rest_id, rest_ad)
-                except Exception:
-                    pass
-            break
+                    stash(aid, ad)
+            except Exception:
+                pass
+            continue
         try:
-            if not basic_filter(ad):  # не телефон (чехол, планшет и т.п.): не запоминаем, повторная проверка стоит дёшево
-                unstash(ad_id)
-                continue
-            text, ok = process_ad(ad)
-            record_ad(ad, ok)
-        except Exception as e:  # иначе одно «ядовитое» объявление роняло бы каждый запуск
-            log("Ошибка обработки объявления, пропускаю его:", ad_id, e)
-            seen.add(ad_id)
-            unstash(ad_id)
+            text, ok_stat = process_ad(ad, fresh_until=lt + FRESH_MAX_AGE_S)
+            record_ad(ad, ok_stat)
+        except Exception as e:
+            log("Ошибка обработки объявления, пропускаю его:", aid, e)
+            seen.add(aid)
+            unstash(aid)
+            mdb_note(aid, "failed", "ошибка обработки")
             continue
         if text is None:
             log("Не телефон (по мнению нейросети), пропускаю:", ad.get("subject"))
-            seen.add(ad_id)
-            unstash(ad_id)
+            seen.add(aid)
+            unstash(aid)
+            continue
+        ok, reason, age, _lt = fresh_before_send(ad)  # последняя проверка прямо перед отправкой: 0 ≤ возраст ≤ 300 с
+        if not ok:
+            log(f"Не отправляю {aid}: к моменту отправки {SKIP_RU.get(reason, reason)}" + (f" ({age:.0f} с)" if age is not None else ""))
+            mdb_note(aid, "expired", f"к моменту отправки: {SKIP_RU.get(reason, reason)}")
+            seen.add(aid)
+            unstash(aid)
             continue
         result = send_ad(text)
         if result == "retry":
-            stash(ad_id, ad)  # не помечаем как просмотренное и запоминаем для повтора
+            stash(aid, ad)  # не помечаем отправленным; повтор будет, только если объявление ещё свежее
+            mdb_note(aid, "failed", "Telegram не принял сообщение")
             continue
-        seen.add(ad_id)
-        unstash(ad_id)
+        seen.add(aid)
+        unstash(aid)
         if result == "sent":
-            log("Отправил:", ad.get("subject"))
+            mdb_note(aid, "sent")
+            log(f"Отправил: {ad.get('subject')} (возраст {age:.0f} с)")
             save_seen(seen)  # контрольная точка: оборванный запуск не пришлёт то же самое второй раз
+            mdb_save()
             time.sleep(SEND_PAUSE)  # Telegram не любит очереди из десятков сообщений подряд
+        else:
+            mdb_note(aid, "failed", "Telegram отклонил текст сообщения")
     return ok_queries, len(queries)
 
 
 def dry_run():
-    """Тестовый запуск: реальные запросы к Куфару, разбор и оценка, но в Telegram ничего не уходит и seen.json не меняется.
-    Показывает до DRY_LIMIT подходящих объявлений из выдачи (вне зависимости от того, видел ли их бот раньше)."""
-    load_seen()  # кеш аналогов из seen.json, только чтение
+    """Тестовый запуск: реальные запросы к Куфару, разбор и оценка, но в Telegram ничего не уходит, seen.json и база не меняются.
+    Показывает до DRY_LIMIT подходящих объявлений из выдачи (вне зависимости от свежести — чтобы было что посмотреть) и для
+    каждого пишет, ушло бы оно в настоящем запуске и почему. В конце — сводка по свежести всей выдачи."""
+    seen = load_seen() or Seen()  # кеш аналогов и метки номеров из seen.json, только чтение
+    mdb_load()
     t0 = time.time()
-    RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0, img_fails=0)
+    RUN.update(deadline=t0 + RUN_BUDGET_S, cards=0, card_fails=0, img_fails=0, db_comps=0)
     _MARKET_REFRESHES["n"] = 0
     llm_reset()
-    log(f"ТЕСТОВЫЙ ЗАПУСК: покажу до {DRY_LIMIT} подходящих объявлений. В Telegram ничего не уходит, seen.json не меняется.")
-    shown, ok_queries = set(), 0
+    log(f"ТЕСТОВЫЙ ЗАПУСК: покажу до {DRY_LIMIT} подходящих объявлений. В Telegram ничего не уходит, seen.json и база не меняются.")
+    shown, ok_queries, found = set(), 0, {}
     for q in list(QUERIES) + pick_extra(t0):
         try:
-            ads = fetch(q)
+            ads = fetch_fresh(q, t0)
         except Exception as e:
             log(f"Ошибка Куфара ({q}):", e)
             continue
         ok_queries += 1
-        for ad in ads:
-            if len(shown) >= DRY_LIMIT:
-                break
-            try:
-                if not isinstance(ad, dict) or ad.get("ad_id") is None or ad["ad_id"] in shown or not basic_filter(ad):
-                    continue
-                text, _ok = process_ad(ad)
-            except Exception as e:
-                log("Ошибка обработки объявления:", e)
-                continue
-            if text is not None:
-                shown.add(ad["ad_id"])
-                tg_send(text)
-        if len(shown) >= DRY_LIMIT:
-            break
+        for a in ads:
+            if isinstance(a, dict) and a.get("ad_id") is not None:
+                found.setdefault(a["ad_id"], a)
         time.sleep(KUFAR_PAUSE)
+    marks_add(STATE["marks"], found.values())
+    why = {}
+    for aid, ad in found.items():
+        try:
+            if not basic_filter(ad):
+                continue
+            reason = candidate_reason(int(aid), ad, seen, mdb_first_lt(aid))
+        except Exception as e:
+            log("Ошибка проверки объявления:", aid, e)
+            continue
+        why.setdefault(reason or "fresh", []).append(aid)
+        if len(shown) >= DRY_LIMIT:
+            continue
+        try:
+            text, _ok = process_ad(ad)
+        except Exception as e:
+            log("Ошибка обработки объявления:", e)
+            continue
+        if text is not None:
+            shown.add(aid)
+            _ok_f, _r, age, _lt = fresh_status(ad)
+            log(f"Объявление {aid}: list_time={ad.get('list_time')!r}, возраст "
+                f"{'—' if age is None else f'{age:.0f} с'} → " + ("УШЛО БЫ в Telegram" if not reason else f"не ушло бы: {SKIP_RU.get(reason, reason)}"))
+            tg_send(text)
     llm_log_summary()
     if not ok_queries:
         sys.exit("Куфар не ответил ни на один запрос")
+    log("Свежесть подходящих объявлений в выдаче: " + "; ".join(
+        f"{'свежие (ушли бы)' if r == 'fresh' else SKIP_RU.get(r, r)} — {len(v)}" for r, v in sorted(why.items())))
     log(f"Тестовый запуск закончен: показано объявлений — {len(shown)}")
 
 
+LOCK_FILE = Path(__file__).with_name(".kufar_bot.lock")
+_LOCK = {}
+
+
+def acquire_lock():
+    """Не даёт двум копиям бота работать одновременно на одной машине (основная защита в GitHub Actions — concurrency
+    в workflow). True — можно работать. Без fcntl (Windows) полагаемся только на workflow."""
+    try:
+        import fcntl
+    except ImportError:
+        return True
+    try:
+        fh = open(LOCK_FILE, "w")
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    _LOCK["fh"] = fh
+    return True
+
+
 NOTICE_TEXT = (
-    "🔄 Бот обновлён. Теперь он ищет ещё iPhone 7–11 (включая X/XR/XS/XS Max), iPhone SE 2016–2022 и Galaxy S7–S9, "
-    "а к каждому объявлению добавляет разбор, оценку цены по аналогам с Куфара и расчёт перепродажи.\n"
-    "Цены аналогов — это цены активных объявлений, а не сделок. Оценка приблизительная, прибыль не гарантируется."
+    "🔄 Бот обновлён. Теперь в Telegram приходят только объявления, опубликованные не больше 5 минут назад: дата проверяется "
+    "перед отправкой ещё раз, а поднятые старые объявления отсеиваются. Сообщения стали короткими: рынок, максимум покупки, "
+    "прибыль и вердикт. Цены аналогов — это цены объявлений, а не сделок; бот копит их в базе рынка (market_history.json)."
 )
 
 
@@ -3125,13 +4314,19 @@ def main():
 
     if "--report" in sys.argv:
         load_seen()  # заполняет HISTORY
+        mdb_load()   # отчёт берёт цены и из базы рынка
         send_report()
         llm_log_summary()
+        return
+
+    if not acquire_lock():
+        log("Другая копия бота уже работает — этот запуск ничего не делает (защита от параллельных запусков)")
         return
 
     seen = load_seen()
     first_run = seen is None
     seen = seen or Seen()
+    mdb_load()
 
     if "--once" in sys.argv:
         # Один проход и выход — для запуска по расписанию (GitHub Actions)
@@ -3142,7 +4337,8 @@ def main():
         if not ok_queries or (first_run and ok_queries < total):
             sys.exit("Куфар ответил не на все запросы — состояние не сохраняю")
         if first_run:
-            tg_send("✅ Мониторинг Куфара запущен (по расписанию): " + ", ".join(QUERIES))
+            tg_send("✅ Мониторинг Куфара запущен (по расписанию): " + ", ".join(QUERIES)
+                    + f". Приходят только публикации не старше {FRESH_MAX_AGE_S / 60:g} мин.")
             STATE["notice"] = NOTICE_VERSION
         elif STATE["notice"] < NOTICE_VERSION:
             try:
@@ -3151,6 +4347,7 @@ def main():
             except Exception as e:
                 log("Не отправилось уведомление об обновлении, попробую позже:", e)
         save_seen(seen)
+        mdb_save()
         return
 
     tg_send("✅ Мониторинг Куфара запущен: " + ", ".join(QUERIES))
@@ -3163,6 +4360,7 @@ def main():
             llm_log_summary(always=False)
             first_run = False
             save_seen(seen)
+            mdb_save()
         except Exception as e:
             log("Ошибка в цикле, продолжаю:", e)
         time.sleep(INTERVAL)

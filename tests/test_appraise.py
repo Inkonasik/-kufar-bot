@@ -243,33 +243,33 @@ check("XS: основа — общий рынок, уверенность низ
 cx, stx = rxs["calc"], rxs["stats"]
 check("XS: вариант 2 (ремонт) — основной: вариант 1 оценить не из чего (аналогов с слабым акб нет)", rxs["plan"]["best"] == "B" and rxs["plan"]["A"] is None, rxs["plan"]["best"])
 check("XS: цена выставления = медиана 34 объявлений (445)", cx["list"] == k.rnd5(stx["med"]) == 445, cx)
-check("XS: быстрая продажа = нижняя четверть (390)", cx["quick"] == k.rnd5(stx["q1"]) == 390, cx)
+check("XS: быстрая продажа = нижняя четверть, округлено ВНИЗ до 5 (q1 387,5 → 385)", cx["quick"] == k.floor5(stx["q1"]) == 385, cx)
 check("XS: целевая прибыль = 12% от быстрой, вверх до 5 (50)", cx["target"] == 50, cx["target"])
-check("XS: лимит до ремонта = 390 − 0 − 50 = 340", cx["raw"] == 340 and cx["limit"] == 340, cx)
+check("XS: лимит до ремонта = 385 − 0 − 50 = 335", cx["raw"] == 335 and cx["limit"] == 335, cx)
 check("XS: ремонт не известен — не выдуман, лимит предварительный", cx["rep_unknown"] and cx["rep_hi"] == 0 and not cx["final"], cx)
-check("XS: запас на ремонт 340 − 250 = 90; прибыль до ремонта 140 / 195", cx["gap"] == 90 and cx["profit"] == 140 and cx["profit_opt"] == 195, cx)
-check("XS: вывод «недостаточно данных» с конкретикой (ремонт ≤ 90 BYN)", rxs["decision"][0] == "unknown" and rxs["decision"][1].startswith(FOUR[3]) and "90 BYN" in rxs["decision"][1], rxs["decision"])
+check("XS: запас на ремонт 335 − 250 = 85; прибыль до ремонта 135 / 195", cx["gap"] == 85 and cx["profit"] == 135 and cx["profit_opt"] == 195, cx)
+check("XS: вывод «недостаточно данных» с конкретикой (ремонт ≤ 85 BYN)", rxs["decision"][0] == "unknown" and rxs["decision"][1].startswith(FOUR[3]) and "85 BYN" in rxs["decision"][1], rxs["decision"])
 
 # известная цена замены аккумулятора: ремонт вычитается один раз, вывод однозначный
-for repair, price_kop, code, limit in ((60, 25000, "buy", 280), (120, 25000, "bargain", 220), (200, 25000, "skip", 140), (340, 25000, "skip", 0)):
+for repair, price_kop, code, limit in ((60, 25000, "buy", 275), (120, 25000, "bargain", 215), (200, 25000, "skip", 135), (340, 25000, "skip", 0)):
     _a, _f, _r = xs(price_kop, repair={"battery": repair})
     c_ = _r["calc"]
-    check(f"XS ремонт {repair}: лимит = 390 − {repair} − 0 − 50, ремонт один раз", c_["final"] and c_["rep_hi"] == repair and c_["limit"] == limit, c_)
-    check(f"XS ремонт {repair}: прибыль = 390 − 250 − {repair}", c_["profit"] == 390 - 250 - repair and c_["profit_opt"] == 445 - 250 - repair, c_)
+    check(f"XS ремонт {repair}: лимит = 385 − {repair} − 0 − 50, ремонт один раз", c_["final"] and c_["rep_hi"] == repair and c_["limit"] == limit, c_)
+    check(f"XS ремонт {repair}: прибыль = 385 − 250 − {repair}", c_["profit"] == 385 - 250 - repair and c_["profit_opt"] == 445 - 250 - repair, c_)
     check(f"XS ремонт {repair}: вывод {code}", _r["decision"][0] == code, _r["decision"])
 _a, _f, _r = xs(25000, repair={"battery": 120})
-check("XS ремонт 120: «только после торга до 220 BYN»", _r["decision"][1].startswith("Покупать только после торга до 220 BYN"), _r["decision"])
+check("XS ремонт 120: «только после торга до 215 BYN»", _r["decision"][1].startswith("Покупать только после торга до 215 BYN"), _r["decision"])
 _a, _f, _r = xs(25000, "Состояние хорошее, акб 74%. Без торга.", repair={"battery": 120})
 check("XS ремонт 120 и «без торга»: не покупать", _r["decision"][0] == "skip" and "без торга" in _r["decision"][1], _r["decision"])
 # прочие расходы вычитаются один раз
 k.EXTRA_COSTS_BYN = 10
 _a, _f, _r = xs(25000, repair={"battery": 60})
 c_ = _r["calc"]
-check("прочие расходы: лимит 270 (−10 один раз), прибыль 70", c_["limit"] == 270 and c_["profit"] == 390 - 250 - 60 - 10, c_)
+check("прочие расходы: лимит 265 (−10 один раз), прибыль 65", c_["limit"] == 265 and c_["profit"] == 385 - 250 - 60 - 10, c_)
 k.EXTRA_COSTS_BYN = 0
 # цена выше лимита при неизвестном ремонте
 _a, _f, _r = xs(38000)
-check("XS 380 при лимите 340 и неизвестном ремонте: торг до «340 минус ремонт»", _r["decision"][0] == "bargain" and _r["decision"][1].startswith("Покупать только после торга до 340 BYN минус ремонт"), _r["decision"])
+check("XS 380 при лимите 335 и неизвестном ремонте: торг до «335 минус ремонт»", _r["decision"][0] == "bargain" and _r["decision"][1].startswith("Покупать только после торга до 335 BYN минус ремонт"), _r["decision"])
 _a, _f, _r = xs(45000)
 check("XS 450: не покупать (выше лимита на 24%)", _r["decision"][0] == "skip" and _r["decision"][1].startswith(FOUR[2]), _r["decision"])
 # аналоги с таким же дефектом (аккумулятор в заголовке) — оценка по ним, ремонт не вычитается

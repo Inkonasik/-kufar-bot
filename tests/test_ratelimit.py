@@ -19,6 +19,8 @@ sys.path.insert(0, str(tmp))
 import requests  # noqa: E402
 import kufar_bot as k  # noqa: E402
 
+k.MESSAGE_STYLE = "full"  # здесь проверяются пометки про нейросеть и фото — они есть в подробном разборе
+
 bad = 0
 real_time = time.time
 
@@ -663,9 +665,22 @@ MODELS_FOR_ADS = ["7", "8", "X", "XS", "XR", "11"]
 PRE_HISTORY = {"900001": {"t": int(real_time()) - 3600, "m": "iPhone 8", "p": 100, "c": "Б/у", "s": "s", "l": "l", "ok": True}}
 
 
+def iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
 def make_ads(n, base_id=7000):
-    return [ad(f"iPhone {MODELS_FOR_ADS[i % 6]} 64gb", 30000 + 100 * i, f"Описание {i}. Всё работает.", ad_id=base_id + i, images=imgs(3, f"u{base_id}_{i}"))
-            for i in range(n)]
+    """n свежих объявлений (опубликованы минуту назад) + опорное объявление 45-минутной давности с меньшим номером:
+    по нему бот подтверждает, что это новые публикации, а не поднятые старые (см. originality)."""
+    now = time.time()
+    out = []
+    for i in range(n):
+        a = ad(f"iPhone {MODELS_FOR_ADS[i % 6]} 64gb", 30000 + 100 * i, f"Описание {i}. Всё работает.", ad_id=base_id + i, images=imgs(3, f"u{base_id}_{i}"))
+        a["list_time"] = iso(now - 60)
+        out.append(a)
+    ref = ad("Чехол для iPhone", 1000, "", ad_id=100)
+    ref["list_time"] = iso(now - 2700)
+    return out + [ref]
 
 
 def run_cycle(ads, srv, seen=None, reset_state=True):
@@ -675,6 +690,7 @@ def run_cycle(ads, srv, seen=None, reset_state=True):
     k.QUERIES, k.EXTRA_QUERIES, k.MARKET_MAX_REFRESH = ["iphone"], [], 0
     if reset_state:
         k.STATE.update(market={}, baseline=["iphone"], pending={}, notice=k.NOTICE_VERSION)
+        k.mdb_reset()  # чистый старт: и журнал отправок в базе рынка
         k.HISTORY.clear()
         k.HISTORY.update(json.loads(json.dumps(PRE_HISTORY)))
     k.SEEN_FILE = tmp / "seen_cycle.json"
@@ -699,7 +715,7 @@ check("итог в логе: запросов 2, ответов 429: 2, нейр
       any("Нейросеть за запуск: запросов 2" in m and "ответов 429: 2" in m and "отключена до конца запуска" in m for m in logs), [m for m in logs if "за запуск" in m])
 data = json.loads(k.SEEN_FILE.read_text())
 check("seen.json: отметки времени сохраняются вместе с теми же полями состояния; кеш нейросети не записывается",
-      set(data) == {"seen", "history", "market", "baseline", "notice", "pending"}
+      set(data) == {"seen", "history", "market", "baseline", "notice", "pending", "marks"}
       and {int(x) for x in data["seen"]} == set(range(7000, 7006))
       and all(isinstance(t, int) for t in data["seen"].values())
       and "900001" in data["history"], sorted(data))
@@ -732,8 +748,9 @@ check("бюджет запуска 60 с при паузе 6 с: часть об
 check("…все отправленные — с разбором нейросетью, не более 10 запросов в минуту", all(not photo_note(s) for s in sent1) and window_max(srv.times()) <= 10)
 clock.t += 300  # следующий запуск cron-job.org через 5 минут: новый процесс (здесь — сброс нейросети через cycle), очередь разбирается первой
 sent2, seen, res = run_cycle(ads12, srv, seen=seen, reset_state=False)
-check("следующий запуск: остаток доставлен, повторов нет, очередь пуста",
-      len(sent1) + len(sent2) == 12 and seen == set(range(7200, 7212)) and k.STATE["pending"] == {}, (len(sent1), len(sent2), sorted(seen)))
+check("следующий запуск через 5 минут: остаток очереди уже старше 5 минут — НЕ отправлен, очередь пуста, повторов нет",
+      sent2 == [] and k.STATE["pending"] == {} and set(queued).isdisjoint(seen) and len(sent1) + len(queued) == 12,
+      (len(sent1), len(sent2), k.STATE["pending"].keys()))
 time.time = real_time
 k.RUN_BUDGET_S = 200
 
@@ -743,6 +760,7 @@ ads2 = make_ads(2, base_id=7400)
 sent, seen, res = run_cycle(ads2, srv)
 n_calls = len(srv.calls)
 seen.clear()
+k.mdb_reset()  # и журнал отправок в базе: проверяем именно кеш разборов нейросети, а не защиту от повторов
 sent_again, seen, res = run_cycle(ads2, srv, seen=seen, reset_state=False)
 check("повторный проход по тем же объявлениям в одном процессе: новых запросов к Gemini нет (кеш), сообщения те же",
       n_calls == 2 and len(srv.calls) == 2 and len(sent_again) == 2 and k.LLM_STATS["cached"] == 2, (n_calls, len(srv.calls), k.LLM_STATS))

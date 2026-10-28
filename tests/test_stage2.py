@@ -136,7 +136,7 @@ for n, (title, desc, price, repair) in enumerate(CASES):
     a = ad("iPhone XS 64gb", price, desc, ad_id=9200 + n)
     f = k.rule_facts(a)
     ap = k.appraise(a, f)
-    msg = k.build_message(a, f, ap)
+    msg = k.build_full_message(a, f, ap)
     RUNS[title.split(".")[0]] = (title, desc, price, repair, a, f, ap, msg)
     if VERBOSE:
         print("=" * 90, "\n", title, "\n", msg)
@@ -174,15 +174,15 @@ pl = ap["plan"]
 A, B = pl["A"], pl["B"]
 check("2: категория «заметные дефекты», оценка «как есть» по 6 аналогам с экраном в тексте",
       k.ad_cat(f) == "visible" and pl["asis"]["src"] == "same" and pl["asis"]["n"] == 6 and pl["asis"]["found"], pl["asis"])
-check("2: вариант 1: быстро 205 / выставлять 220, резерв 15, цель 25 -> максимум 165, желательно 150, отказ 205",
-      (A["quick"], A["list"], A["reserve"], A["target"], A["limit"], A["desired"], A["walk"]) == (205, 220, 15, 25, 165, 150, 205), A)
+check("2: вариант 1: быстро 200 (нижняя четверть вниз до 5) / выставлять 220, резерв 10, цель 25 -> максимум 165, желательно 150, отказ 210",
+      (A["quick"], A["list"], A["reserve"], A["target"], A["limit"], A["desired"], A["walk"]) == (200, 220, 10, 25, 165, 150, 210), A)
 check("2: вариант 1 без ремонта (ремонт не вычитается из цены аналогов с таким же дефектом)", A["rep_hi"] == 0 and A["rep_unknown"] == [], A)
 check("2: вариант 2 по исправным аналогам (370/400), цена ремонта не известна -> расчёт предварительный",
       (B["quick"], B["list"], B["final"], B["rep_unknown"]) == (370, 400, False, ["проблемы с экраном"]) and B["limit"] == 305, B)
 check("2: безубыточность ремонта 120 BYN и «что если» 60/120/180 -> 235/165/95",
       pl["breakeven"] == 120 and pl["sens"] == [(60, 235), (120, 165), (180, 95)], (pl["breakeven"], pl["sens"]))
-check("2: вывод — не покупать (240 выше цены отказа 205) + порог ремонта для варианта 2",
-      ap["decision"][0] == "skip" and "выше цены отказа 205 BYN" in ap["decision"][1] and "обойдётся не дороже ≈ 55 BYN" in ap["decision"][1], ap["decision"])
+check("2: вывод — не покупать (240 выше цены отказа 210) + порог ремонта для варианта 2",
+      ap["decision"][0] == "skip" and "выше цены отказа 210 BYN" in ap["decision"][1] and "обойдётся не дороже ≈ 55 BYN" in ap["decision"][1], ap["decision"])
 check("2: сообщение: ремонт не придуман, «до вычета ремонта», чувствительность подписана",
       "бот её не придумывает" in msg and "(до вычета ремонта)" in msg and "Что если (не цены ремонта, а чувствительность)" in msg
       and "Ремонт выгоднее варианта 1, только если запчасти + работа не дороже ≈ 120 BYN" in msg, msg)
@@ -264,7 +264,7 @@ for it in its:
 its[10][3] |= k.F_BOX  # одна коробка среди аналогов без названных дефектов
 fk = k.rule_facts(ad("iPhone XS 64gb", 34000, "коробка, чек", ad_id=9300))
 apk = k.appraise(ad("iPhone XS 64gb", 34000, "коробка, чек", ad_id=9300), fk)
-mk = k.build_message(ad("iPhone XS 64gb", 34000, "коробка, чек", ad_id=9300), fk, apk)
+mk = k.build_full_message(ad("iPhone XS 64gb", 34000, "коробка, чек", ad_id=9300), fk, apk)
 check("5: аналогов с коробкой мало -> «влияние не оценить», цифры не выдуманы",
       k.kit_effect(apk)[0] is None and "Влияние коробки на цену не оценить: аналогов с коробкой 1, без неё 20 (нужно ≥ 3 в каждой группе)" in mk, mk)
 xs_market()
@@ -339,8 +339,8 @@ q_fault = k.price_stats([100, 110, 120, 130])["q1"]
 check("между категориями: источник «расчёт», не «найдено»; 0 объявлений в основе",
       asis["src"] == "interp" and asis["found"] is False and asis["n"] == 0 and asis["st"] is None, asis)
 check("между категориями: цена — середина между «небольшими» и «неисправными» (глубина 2 из 1…3)",
-      asis["quick"] == k.rnd5((q_minor + q_fault) / 2) and asis["between"] == (1, 3), (asis, q_minor, q_fault))
-mi = k.build_message(ai, fi, api)
+      asis["quick"] == k.floor5((q_minor + q_fault) / 2) and asis["between"] == (1, 3), (asis, q_minor, q_fault))  # быстрая продажа — вниз до 5
+mi = k.build_full_message(ai, fi, api)
 check("между категориями: в сообщении подписано «расчёт (допущение)», строка категории — «объявлений нет»",
       "расчёт (допущение): между категориями «небольшие дефекты» и «неисправные»" in mi and "заметные дефекты: объявлений нет ◀ этот телефон" in mi, mi)
 check("между категориями: сравнение с «такими же» не делается (нет вердикта по рынку)", api["verdict"] is None and not api["like_for_like"] and "По рынку:" not in mi, api["verdict"])
@@ -357,7 +357,7 @@ put_market("iPhone XS", [[2000 + i, 400 + i * 5, 64, 0, 1, 0] for i in range(20)
 an = ad("iPhone XS 64gb", 20000, "Разбит экран.", ad_id=9402)
 fn = k.rule_facts(an)
 apn = k.appraise(an, fn)
-mn = k.build_message(an, fn, apn)
+mn = k.build_full_message(an, fn, apn)
 check("нет аналогов категории: вариант 1 честно «не из чего», вариант 2 посчитан до вычета ремонта",
       apn["plan"]["A"] is None and apn["plan"]["B"] and not apn["plan"]["B"]["final"] and "Оценить продажу «как есть» не из чего" in mn
       and "найдено 0, нужно ≥ 3" in mn and "(до вычета ремонта)" in mn, mn)
@@ -365,7 +365,7 @@ check("нет аналогов категории: вывод — одна из 
 aw = ad("iPhone XS 64gb", 20000, "Телефон после воды.", ad_id=9403)
 fw = k.rule_facts(aw)
 apw = k.appraise(aw, fw)
-mw = k.build_message(aw, fw, apw)
+mw = k.build_full_message(aw, fw, apw)
 check("критичный дефект (вода): не покупать, вариант 2 не рассматривается, расходы на ремонт не выдуманы",
       apw["decision"][0] == "skip" and "Не рассматриваю" in mw and apw["plan"]["B"] is None and "ремонт 0" not in mw, apw["decision"])
 
@@ -376,7 +376,7 @@ put_market("iPhone XS", [[2000 + i, 400 + i * 10, 64, 0, 1, 0] for i in range(4)
 at = ad("iPhone XS 64gb", 25000, "Продаю.", ad_id=9500)
 ft = k.rule_facts(at)
 apt = k.appraise(at, ft)
-mt = k.build_message(at, ft, apt)
+mt = k.build_full_message(at, ft, apt)
 check("мало аналогов (4 < 5): прибыль положительная, но вывод — «пока недостаточно данных», уровни цены всё равно посчитаны",
       apt["thin"] and apt["plan"]["A"]["profit"] > 0 and apt["decision"][0] == "unknown" and "аналогов мало (4, нужно ≥ 5)" in apt["decision"][1]
       and "Цена покупки: желательно ≤" in mt, (apt["decision"], apt["plan"]["A"]))
@@ -389,7 +389,7 @@ check("цена вдвое ниже рынка: объявление не поп
 anp = ad("iPhone XS 64gb", 0, "Цена договорная.", ad_id=9502)
 fnp = k.rule_facts(anp)
 apnp = k.appraise(anp, fnp)
-mnp = k.build_message(anp, fnp, apnp)
+mnp = k.build_full_message(anp, fnp, apnp)
 check("нет цены: вывод «недостаточно данных» со ссылкой на отсутствие цены; максимум покупки всё равно назван",
       apnp["decision"][0] == "unknown" and "нет цены" in apnp["decision"][1] and "Цена покупки: желательно ≤" in mnp and "Прибыль при цене" not in mnp, apnp["decision"])
 defaults()
@@ -532,7 +532,7 @@ check("фото: расхождение с описанием сохранено
 check("фото не меняет цену автоматически; текстовая категория остаётся из описания", k.ad_cat(fp) == "ok", (k.ad_cat(fp), fp["defects"]))
 xs_market()
 apf = k.appraise(phone_ad, fp)
-mf = k.build_message(phone_ad, fp, apf)
+mf = k.build_full_message(phone_ad, fp, apf)
 check("фото в сообщении: что видно, уверенность, что проверить, расхождение с текстом",
       "По фото (4 из 5) видно:" in mf and "трещина в углу экрана (уверенность: высокая)" in mf and "Проверить: тач по всей площади" in mf
       and "⚠ Расхождение с описанием: в тексте «идеал», а на экране трещина" in mf, mf)
@@ -551,7 +551,7 @@ bad_q["photos"]["quality"] = "плохое"
 k.requests.post = make_post(bad_q)
 k.RUN.update(img_fails=0)
 fq = k.analyze_ad(phone_ad)
-mq = k.build_message(phone_ad, fq, k.appraise(phone_ad, fq))
+mq = k.build_full_message(phone_ad, fq, k.appraise(phone_ad, fq))
 check("плохое качество фото: дефекты по фото в расчёт не идут, в сообщении предупреждение",
       "screen" not in fq["defects"] and k.ad_cat(fq) == "ok" and "качество фото плохое" in mq, (fq["defects"], mq[:200]))
 # нет видимых дефектов
@@ -562,7 +562,7 @@ clean_r["photos"] = {"findings": [], "kit_visible": [], "mismatch": "", "quality
 k.requests.post = make_post(clean_r)
 k.RUN.update(img_fails=0)
 fc = k.analyze_ad(phone_ad)
-mc = k.build_message(phone_ad, fc, k.appraise(phone_ad, fc))
+mc = k.build_full_message(phone_ad, fc, k.appraise(phone_ad, fc))
 check("на фото дефектов нет: сказано «это не проверка работы телефона»", "видимых дефектов не найдено; это не проверка работы телефона" in mc, mc)
 # нейросеть не приняла запрос с фото -> статус error; повторный текстовый запрос не расходуется
 posts.clear()
@@ -570,7 +570,7 @@ reset_llm()
 k.requests.post = make_post(REPLY | {"summary": "Только текст."}, fail_with_images=True)
 k.RUN.update(img_fails=0)
 fe = k.analyze_ad(phone_ad)
-me = k.build_message(phone_ad, fe, k.appraise(phone_ad, fe))
+me = k.build_full_message(phone_ad, fe, k.appraise(phone_ad, fe))
 second = posts[-1]["json"]["contents"][0]["parts"]
 check("запрос с фото не прошёл: статус error, второй запрос не делается, текстовые правила работают",
       fe["photo"]["status"] == "error" and len(posts) == 1 and not fe["llm"] and "нейросеть не приняла запрос с фото" in me,
@@ -579,7 +579,7 @@ check("запрос с фото не прошёл: статус error, втор�
 k.GEMINI_KEY = ""
 reset_llm()
 fnk = k.analyze_ad(phone_ad)
-check("нет ключа нейросети: «не анализировались», сообщение собирается", fnk["photo"]["status"] == "no_llm" and "не подключена нейросеть" in k.build_message(phone_ad, fnk, k.appraise(phone_ad, fnk)))
+check("нет ключа нейросети: «не анализировались», сообщение собирается", fnk["photo"]["status"] == "no_llm" and "не подключена нейросеть" in k.build_full_message(phone_ad, fnk, k.appraise(phone_ad, fnk)))
 k.GEMINI_KEY = "fake-key"
 k.requests.post = make_post(REPLY)
 reset_llm()

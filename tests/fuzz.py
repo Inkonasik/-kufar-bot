@@ -144,7 +144,7 @@ for i in range(N):
                 if f["conf"] == "высокая" and f["kind"] in ("screen", "cosmetic", "camera") and facts["photo"].get("quality") != "плохое":
                     facts["defects"].setdefault(f["kind"], "по фото: " + f["what"])
         ap = k.appraise(ad, facts)
-        msg = k.build_message(ad, facts, ap)
+        msg = k.build_full_message(ad, facts, ap)
     except Exception as e:
         fail("исключение", repr(e), ctx)
         continue
@@ -181,6 +181,36 @@ for i in range(N):
         fail("нет оговорки «цены объявлений, не сделок»")
     if not cut and "Комплект:" not in msg:
         fail("нет строки про комплект")
+    # ---- короткое сообщение (то, что уходит в Telegram по умолчанию) ----
+    sm = k.build_short_message(ad, facts, ap)
+    verdicts = len(re.findall(r"<b>(?:ВЫГОДНО|НЕВЫГОДНО(?: по текущей цене)?|НЕДОСТАТОЧНО ДАННЫХ)</b>", sm))
+    if verdicts != 1:
+        fail("короткое: вердикт не один", sm)
+    if len(sm) > 1100:
+        fail("короткое: слишком длинное", len(sm), sm)
+    if sm.count("<b>") != sm.count("</b>") or re.search(r"\bnan\b|\binf\b|\bNone\b|[{}]", sm):
+        fail("короткое: теги/nan/None", sm[:300])
+    if html.escape(ad["ad_link"]) not in sm:
+        fail("короткое: ссылка потеряна")
+    if desc and len(desc) > 40 and desc[:40] in sm:
+        fail("короткое: пересказ описания продавца", sm)
+    shown_price = re.search(r"Цена продавца: ([\d ]+) BYN", sm)
+    if facts["price"] and (not shown_price or int(shown_price.group(1).replace(" ", "")) != round(facts["price"])):
+        fail("короткое: цена продавца не та", facts["price"], sm[:120])
+    if not facts["price"] and "не указана — нужно уточнить" not in sm:
+        fail("короткое: нет «цену нужно уточнить»", sm[:120])
+    if code == "buy" and ap.get("conf") != "низкая" and "✅ <b>ВЫГОДНО</b>" not in sm:
+        fail("короткое: buy без ВЫГОДНО", sm)
+    if (code == "skip" or sev >= 3) and "<b>НЕВЫГОДНО" not in sm:
+        fail("короткое: skip без НЕВЫГОДНО", code, sm)
+    if code == "unknown" and "НЕДОСТАТОЧНО ДАННЫХ" not in sm:
+        fail("короткое: unknown без НЕДОСТАТОЧНО ДАННЫХ", sm)
+    if "Уверенность:" in sm and "не сделок" not in sm:
+        fail("короткое: нет оговорки «цены объявлений, не сделок»", sm)
+    m_lim = re.search(r"💸 Максимум покупки: ([\d ]+) BYN", sm)
+    m_q = re.search(r"⚡ Быстрая продажа: около ([\d ]+) BYN", sm)
+    if m_lim and m_q and int(m_lim.group(1).replace(" ", "")) > int(m_q.group(1).replace(" ", "")):
+        fail("короткое: максимум покупки выше быстрой продажи", sm)
     # ---- решение ----
     if sev >= 3 and code != "skip":
         fail("критичный дефект без отказа", code, facts["defects"])
@@ -234,7 +264,7 @@ for i in range(N):
             fail("вариант 2 при критичном дефекте или без ремонта", rp, facts["defects"])
         if not near(B["rep_hi"], rp["hi"]) or not near(B["rep_lo"], rp["lo"]) or B["rep_unknown"] != rp["unknown"]:
             fail("ремонт в варианте 2 не равен плану ремонта (один раз)", B, rp)
-        if not clean["st"] or (B["quick"], B["list"]) != (k.rnd5(clean["st"]["q1"]), k.rnd5(clean["st"]["med"])):
+        if not clean["st"] or (B["quick"], B["list"]) != (k.floor5(clean["st"]["q1"]), k.rnd5(clean["st"]["med"])):
             fail("вариант 2 считан не по исправным аналогам", B)
         if not B["reserve"] and k.RISK_RESERVE_PCT and B["quick"] > 0:
             fail("в варианте 2 нет резерва", B)
