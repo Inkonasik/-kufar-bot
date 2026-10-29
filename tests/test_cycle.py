@@ -87,6 +87,8 @@ base = db(d)
 check("1 первый запуск: база рынка создана, в ней только подходящая модель", base and "1001" in base["ads"] and "1002" not in base["ads"],
       list((base or {}).get("ads", {}))[:5])
 check("1 первый запуск: метки номеров сохранены в seen.json", st and st.get("marks"), st and list(st))
+check("1 техническая статистика базы — в журнале (а не в Telegram)", "База рынка: объявлений" in res["stdout"]
+      and not any("База рынка" in m for m in res["sent"]), res["stdout"][-300:])
 check("1 первый запуск: висевшие в выдаче подходящие объявления помечены обработанными (не разошлются позже)", seen_ids(st) == {1001}, seen_ids(st))
 # номера растут со временем, как на Куфаре: часовой давности — 1003, свежие — 1004 и 1005
 res, st = run(d, [{"id": 1001, "subject": "iPhone 5s", "age": 300 + 120 + 1}, (1002, "iPhone 14"),
@@ -97,7 +99,7 @@ check("2 второй запуск: одно уведомление про св�
       res["exit"] == 0 and len(ad_msgs(res)) == 1 and "iPhone 6s" in ad_msgs(res)[0] and 1005 in seen_ids(st) and 1003 not in seen_ids(st),
       [m[:40] for m in ad_msgs(res)])
 check("2 сообщение короткое: цена продавца, вердикт, ссылка; без длинных разделов",
-      ad_msgs(res) and "💰 Цена продавца: 150 BYN" in ad_msgs(res)[0] and "🔗 https://www.kufar.by/item/1005" in ad_msgs(res)[0]
+      ad_msgs(res) and "Цена продавца: 150 BYN" in ad_msgs(res)[0] and "🔗 https://www.kufar.by/item/1005" in ad_msgs(res)[0]
       and "Вариант 2" not in ad_msgs(res)[0] and len(ad_msgs(res)[0]) < 1200, ad_msgs(res)[:1])
 res, st = run(d, [{"id": 1005, "subject": "iPhone 6s 64gb", "lt": T0 + 60}], clock=T0 + 240)
 check("3 повторный запуск: то же объявление второй раз не приходит", res["exit"] == 0 and ad_msgs(res) == [], res["sent"])
@@ -231,8 +233,9 @@ res, st = run(d, [{"id": 5000, "subject": "iPhone 11 64gb", "price": 590, "desc"
               market={"iphone 11": comps})
 m = (ad_msgs(res) or [""])[0]
 check("C короткое сообщение: оценка рынка, максимум покупки, прибыль, вердикт, уверенность",
-      all(x in m for x in ("📊 Перепродажа:", "⚡ Быстрая продажа:", "💸 Максимум покупки:", "🎯 Желательно купить за:", "📈 Прибыль после расходов:",
-                          "Уверенность:", "сопоставим", "не сделок")), m)
+      all(x in m for x in ("<b>РЫНОК</b>", "Перепродажа:", "Цена для быстрой продажи:", "Сопоставимых объявлений:", "<b>ПОКУПКА</b>",
+                          "Максимальная цена покупки:", "Желательно купить за:", "Предполагаемая прибыль после расходов:",
+                          "Доходность на вложенные деньги:", "<b>ИТОГ</b>", "Уверенность:", "не сделок")), m)
 check("C описание продавца не пересказывается", "полный комплект" not in m and "Идеальное" not in m, m)
 check("C одна загрузка аналогов", sum(g == "iphone 11|100" for g in res["gets"]) == 1)
 check("C кеш аналогов сохранён", "iPhone 11" in st["market"] and len(st["market"]["iPhone 11"]["items"]) >= 10)
@@ -249,7 +252,7 @@ state["market"] = {}
 res3, st3 = run(d, [{"id": 5002, "subject": "iPhone 11 64gb", "price": 640}], fail=["iphone 11"], clock=T0 + 120)
 m3 = (ad_msgs(res3) or [""])[0]
 check("C кеша нет и Куфар не отдал аналоги — оценка по базе рынка (не «аналоги не загружены»)",
-      len(ad_msgs(res3)) == 1 and "Максимум покупки" in m3 and "не загружены" not in m3, m3)
+      len(ad_msgs(res3)) == 1 and "Максимальная цена покупки" in m3 and "не загружены" not in m3, m3)
 
 # ---------- D. сбои Telegram ----------
 d, _ = ready()
@@ -321,8 +324,11 @@ d, _ = ready()
 body = "Продам iPhone 11 Pro Max. Использовался аккуратно женой.\nВсё родное, без ремонтов и вскрытий.\nБЕЗ ОБМЕНА И ТОРГА! Разбит экран."
 res, st = run(d, [{"id": 9501, "subject": "iPhone 11 Pro Max", "price": 420}, {"id": 9404, "subject": "iPhone 11"}], bodies={"9501": body})
 m = [x for x in ad_msgs(res) if "Pro Max" in x]
-check("H описание подтянуто: дефект экрана в короткой строке, описание не пересказано",
-      m and "проблемы с экраном" in m[0] and "женой" not in m[0], m[:1])
+rec9501 = (db(d) or {"ads": {}})["ads"].get("9501") or {}
+check("H описание подтянуто из карточки: дефект экрана из полного текста учтён (в базе — со ссылкой на текст продавца), "
+      "описание в сообщении не пересказано и отдельного раздела «по описанию» нет",
+      m and "screen" in (rec9501.get("defects") or {}) and rec9501.get("defects_src") == "текст продавца"
+      and "женой" not in m[0] and "По описанию" not in m[0], (m[:1], rec9501.get("defects")))
 m2 = [x for x in ad_msgs(res) if "<b>iPhone 11" in x and "Pro" not in x]
 check("H карточка 404: сообщение всё равно пришло", bool(m2), [x[:40] for x in ad_msgs(res)])
 d, _ = ready()
@@ -352,9 +358,16 @@ check("P вторая копия бота при работающей перво
 d, _ = ready()
 (d / "market_history.json").write_text("{повреждённый файл")
 res, st = run(d, [{"id": 9702, "subject": "iPhone 8 64gb", "age": 30}])
-check("P база повреждена: уведомление всё равно пришло, seen.json записан, повреждённый файл не перезаписан",
+check("P база повреждена, резервная копия цела: восстановление из копии, уведомление пришло, база снова читается",
+      len(ad_msgs(res)) == 1 and 9702 in seen_ids(st) and "1001" in db(d)["ads"] and "9702" in db(d)["ads"]
+      and "восстанавливаю из резервной копии" in res["stdout"], res["stdout"][-400:])
+d, _ = ready()
+(d / "market_history.json").write_text("{повреждённый файл")
+(d / "market_history.backup.json").write_text("{и копия тоже")
+res, st = run(d, [{"id": 9702, "subject": "iPhone 8 64gb", "age": 30}])
+check("P повреждены и база, и копия: уведомление всё равно пришло, seen.json записан, файлы не перезаписаны",
       len(ad_msgs(res)) == 1 and 9702 in seen_ids(st) and (d / "market_history.json").read_text() == "{повреждённый файл"
-      and "повреждена" in res["stdout"], res["stdout"][-400:])
+      and (d / "market_history.backup.json").read_text() == "{и копия тоже" and "повреждена" in res["stdout"], res["stdout"][-400:])
 d, _ = ready()
 db_before = (d / "market_history.json").read_text()
 (d / "market_history.json.tmp").mkdir()  # запись временного файла не удастся

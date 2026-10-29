@@ -153,8 +153,8 @@ check("цена между запусками: история цены [100, 120
       and k.price_changes(rec["price_hist"]) == 1, rec)
 f0, ap0, m0 = evaluate(ad(price=None))
 check("цена не указана: «нужно уточнить», прибыль не считается, вердикт НЕДОСТАТОЧНО ДАННЫХ",
-      "не указана — нужно уточнить" in m0 and "Прибыль: цену нужно уточнить" in m0 and "НЕДОСТАТОЧНО ДАННЫХ" in m0
-      and "Прибыль после расходов" not in m0, m0)
+      "не указана — нужно уточнить" in m0 and "Прибыль и доходность: нужно уточнить цену" in m0 and "НЕДОСТАТОЧНО ДАННЫХ" in m0
+      and "Предполагаемая прибыль" not in m0 and "Доходность на вложенные деньги:" not in m0, m0)
 f0b, ap0b, m0b = evaluate(ad(price=0))
 check("цена 0: то же, что «не указана»", f0b["price"] == 0 and "не указана — нужно уточнить" in m0b)
 
@@ -292,8 +292,8 @@ fok = k.rule_facts(ad("iPhone X 64gb", params=[{"p": "phones_model", "vl": "iPho
 check("заголовок и параметры совпадают: уверенность в модели высокая", fok["model_conf"] == "высокая" and not fok["conflicts"])
 fsc, apsc, msc = evaluate(ad(price=100, desc="Разбит экран, всё остальное работает"))
 check("битый экран: дефект найден, оценка по аналогам с таким же дефектом (их 5), а не по исправным",
-      "screen" in fsc["defects"] and apsc["basis"] == "defect" and "🔧 По описанию: проблемы с экраном" in msc
-      and "📊 Перепродажа: 120" in msc, msc)
+      "screen" in fsc["defects"] and apsc["basis"] == "defect" and "Перепродажа: 120" in msc
+      and "По описанию" not in msc and "Разбит экран" not in msc, msc)  # дефект учтён в цифрах, отдельного раздела нет
 fh, aph, mh = evaluate(ad(price=120, desc="Продаю"))
 unc = aph["plan"]["unconfirmed"]
 check("скрытые функции не проверены: список непроверенного, резерв в расчёте, вердикт «если дефекты не обнаружатся»",
@@ -338,9 +338,11 @@ check("формула: максимум покупки = быстрая прод
       c["quick"] == quick and c["reserve"] == reserve and c["target"] == target and c["limit"] == limit, (c["quick"], c["reserve"], c["target"], c["limit"]))
 check("чистая прибыль и ROI посчитаны верно", abs(c["profit"] - profit) < 1e-9 and abs(c["roi"] - profit / (120 + reserve)) < 1e-9, (c["profit"], c["roi"]))
 check("выгодная покупка: ВЫГОДНО, цифры из расчёта в сообщении",
-      apg["decision"][0] == "buy" and "✅ <b>ВЫГОДНО</b>" in mg and f"💸 Максимум покупки: {limit} BYN" in mg
-      and f"🎯 Желательно купить за: {c['desired']} BYN" in mg and "📈 Прибыль после расходов: около" in mg
-      and f"⚡ Быстрая продажа: около {quick} BYN" in mg and "не сделок" in mg, mg)
+      apg["decision"][0] == "buy" and "✅ <b>ВЫГОДНО</b>" in mg and f"Максимальная цена покупки: {limit} BYN" in mg
+      and f"Желательно купить за: {c['desired']} BYN" in mg and f"Предполагаемая прибыль после расходов: +{profit:.0f} BYN" in mg
+      and f"Доходность на вложенные деньги: +{profit / (120 + reserve) * 100:.0f}%" in mg
+      and f"Цена для быстрой продажи: {quick} BYN" in mg and "не сделок" in mg
+      and all(h in mg for h in ("<b>РЫНОК</b>", "<b>ПОКУПКА</b>", "<b>ИТОГ</b>")) and "ROI" not in mg, mg)
 check("рыночная цена и цена покупки различаются: перепродажа ≈ медиана, максимум покупки ниже быстрой продажи",
       c["limit"] < c["quick"] < c["list"] + 1)
 fx_, apx, mx = evaluate(ad(price=300, desc="Всё работает"))
@@ -442,7 +444,9 @@ k.MARKET_MAX_REFRESH = 0
 items2, age2, stale2, why2 = k.market_items("iPhone X")
 k.MARKET_MAX_REFRESH = 6
 check("кеш выдачи 5-дневной давности не подмешивается как текущий: только активные записи базы",
-      {it[0] for it in items2} == {8100, 8101, 8110} and stale2, ({it[0] for it in items2}, stale2))
+      {it[0] for it in items2} == {8100, 8101, 8110}, {it[0] for it in items2})
+check("возраст выборки из базы — медиана давности наблюдений (1 ч, 2 сут, 1 ч → 1 ч): не «устарела» (свежие записи видели час назад)",
+      age2 is not None and abs(age2 - 3600) < 1 and stale2 is False, (age2, stale2))
 market("iPhone X", CLEAN_X + SCREEN_X)
 k.mdb_reset()
 k.mdb_observe(ad("iPhone X 64gb", price=200, ad_id=8001, desc="акб 88%"), now=T0)
@@ -470,8 +474,17 @@ k.MARKET_DB_MAX = 6000
 check("переполнение: удаляются те, кого дольше всего не видели; отправленные за 30 дней остаются",
       len(json.loads((D / "market_history.json").read_text())["ads"]) == 50 and "8005" in json.loads((D / "market_history.json").read_text())["ads"])
 (D / "market_history.json").write_text('{"ads": [1, 2')
-check("повреждённая база: загрузка честно не удаётся, сохранение отказывается, файл цел",
-      k.mdb_load() is False and k.mdb_save(T0) is False and (D / "market_history.json").read_text() == '{"ads": [1, 2')
+bk = D / "market_history.backup.json"
+check("резервная копия базы записана при сохранении (раз в сутки)", bk.exists() and json.loads(bk.read_text())["ads"], bk.exists())
+n_bk = len(json.loads(bk.read_text())["ads"])
+check("повреждённая база + целая резервная копия: восстановление из копии, сохранение снова работает, основной файл исправлен",
+      k.mdb_load() is True and len(k._mdb_ads()) == n_bk and k.mdb_save(T0) is True
+      and len(json.loads((D / "market_history.json").read_text())["ads"]) == n_bk, (len(k._mdb_ads()), n_bk))
+(D / "market_history.json").write_text('{"ads": [1, 2')
+bk.write_text("тоже испорчено")
+check("повреждены и база, и копия: загрузка честно не удаётся, сохранение отказывается, файлы не тронуты",
+      k.mdb_load() is False and k.mdb_save(T0) is False and (D / "market_history.json").read_text() == '{"ads": [1, 2'
+      and bk.read_text() == "тоже испорчено")
 k.mdb_reset()
 
 print("итого ошибок (свежесть, цена, характеристики, финансы, база):", bad)

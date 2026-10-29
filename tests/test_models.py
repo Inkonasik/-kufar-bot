@@ -1,7 +1,6 @@
 """Тесты определения моделей (iPhone 7–11, SE, Galaxy S7–S9), защиты от ложных совпадений и аксессуаров."""
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 os.environ.update(TG_TOKEN="t", TG_CHAT_ID="1")

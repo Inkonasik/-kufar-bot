@@ -1,7 +1,6 @@
 """Тесты оценки цены и перепродажи на синтетических аналогах (без сети)."""
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 

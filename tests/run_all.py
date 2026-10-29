@@ -8,9 +8,9 @@ import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TESTS = ["test_models", "test_facts", "test_fresh", "test_appraise", "test_message", "test_stage2", "test_llm", "test_ratelimit",
-         "test_report", "test_cycle", "fuzz", "stress_cycle"]
-TIMEOUT_S = {"test_cycle": 600, "test_ratelimit": 300, "fuzz": 300, "stress_cycle": 300}
+TESTS = ["test_lint", "test_models", "test_facts", "test_fresh", "test_market", "test_appraise", "test_message", "test_stage2", "test_llm", "test_vision", "test_ratelimit",
+         "test_report", "test_cycle", "test_audit", "fuzz", "stress_cycle"]
+TIMEOUT_S = {"test_cycle": 600, "test_audit": 600, "test_ratelimit": 300, "fuzz": 300, "stress_cycle": 300}
 SKIP_CODE = 77
 results = {}
 for name in TESTS:

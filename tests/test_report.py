@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 os.environ.update(TG_TOKEN="t", TG_CHAT_ID="1")

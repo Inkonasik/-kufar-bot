@@ -525,11 +525,15 @@ check("Gemini: ключ в заголовке, увеличенный тайма
 ph = fp["photo"]
 check("фото: статус analyzed, просмотрено 4 из 5", ph["status"] == "analyzed" and ph["n"] == 4 and ph["total"] == 5, ph)
 check("фото: находки разобраны, пустая и без текста отброшена, неизвестный вид -> other", [f["kind"] for f in ph["findings"]] == ["screen", "camera", "other"], ph["findings"])
-check("фото-наблюдения не превращаются автоматически в подтверждённые дефекты для расчёта",
-      "screen" not in fp["defects"] and "camera" not in fp["defects"] and "battery" not in fp["defects"], fp["defects"])
+check("фото → расчёт: уверенная видимая трещина — дефект «по фото» (источник фото), пятно на камере средней уверенности — "
+      "только «возможно», «аккумулятор изношен» по фото не принят никогда; слова продавца отдельно и не изменены",
+      fp["defects"].get("screen") == "по фото: трещина в углу экрана" and fp["defect_src"]["screen"] == "фото"
+      and "camera" not in fp["defects"] and "battery" not in fp["defects"] and fp["defects_text"] == {}
+      and [x["what"] for x in fp["photo"]["possible"]] == ["возможное пятно на линзе", "аккумулятор изношен"], (fp["defects"], fp["photo"].get("possible")))
 check("фото: комплектация — только из списка допустимых (выдуманный «золотой кейс» убран)", ph["kit"] == ["коробка", "наушники"], ph["kit"])
 check("фото: расхождение с описанием сохранено", "на экране трещина" in ph["mismatch"], ph["mismatch"])
-check("фото не меняет цену автоматически; текстовая категория остаётся из описания", k.ad_cat(fp) == "ok", (k.ad_cat(fp), fp["defects"]))
+check("категория: по словам продавца — «исправные», с учётом уверенной трещины на фото — «заметные дефекты»",
+      k.ad_cat(dict(fp, defects=fp["defects_text"])) == "ok" and k.ad_cat(fp) == "visible", (k.ad_cat(fp), fp["defects"]))
 xs_market()
 apf = k.appraise(phone_ad, fp)
 mf = k.build_full_message(phone_ad, fp, apf)

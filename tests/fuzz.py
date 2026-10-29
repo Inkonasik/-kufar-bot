@@ -207,10 +207,30 @@ for i in range(N):
         fail("короткое: unknown без НЕДОСТАТОЧНО ДАННЫХ", sm)
     if "Уверенность:" in sm and "не сделок" not in sm:
         fail("короткое: нет оговорки «цены объявлений, не сделок»", sm)
-    m_lim = re.search(r"💸 Максимум покупки: ([\d ]+) BYN", sm)
-    m_q = re.search(r"⚡ Быстрая продажа: около ([\d ]+) BYN", sm)
-    if m_lim and m_q and int(m_lim.group(1).replace(" ", "")) > int(m_q.group(1).replace(" ", "")):
+    num = lambda m_: int(m_.group(1).replace(" ", "").replace("−", "-"))  # noqa: E731
+    m_lim = re.search(r"Максимальная цена покупки: ([\d ]+) BYN", sm)
+    m_q = re.search(r"Цена для быстрой продажи: ([\d ]+) BYN", sm)
+    if m_lim and m_q and num(m_lim) > num(m_q):
         fail("короткое: максимум покупки выше быстрой продажи", sm)
+    stat["short:limit"] = stat.get("short:limit", 0) + bool(m_lim and m_q)
+    if not all(h_ in sm for h_ in ("<b>РЫНОК</b>", "<b>ПОКУПКА</b>", "<b>ИТОГ</b>")):
+        fail("короткое: нет одного из разделов РЫНОК / ПОКУПКА / ИТОГ", sm)
+    if any(x_ in sm for x_ in ("ROI", "По описанию", "По фото", "⚡", "💸", "📈")):
+        fail("короткое: старые подписи или отдельный раздел описания/фото", sm)
+    _b, c_ = k._shown_variant(ap)
+    m_pr = re.search(r"Предполагаемая прибыль после расходов: ([+−\-]?[\d ]+) BYN", sm)
+    m_roi = re.search(r"Доходность на вложенные деньги: ([+−\-]?\d+)%", sm)
+    if m_roi:
+        stat["short:roi"] = stat.get("short:roi", 0) + 1
+        # один сценарий: покупка по цене продавца, продажа по цене для быстрой продажи; доходность = прибыль / вложено
+        exp_profit = c_["quick"] - facts["price"] - c_["costs"]
+        exp_roi = round(exp_profit / (facts["price"] + c_["costs"]) * 100)
+        if not m_pr or abs(num(m_pr) - round(exp_profit)) > 1 or abs(num(m_roi) - exp_roi) > 1 or not c_["final"]:
+            fail("короткое: прибыль и доходность не из одного сценария / формула не та", exp_profit, exp_roi, sm)
+        if m_q and num(m_q) != c_["quick"]:
+            fail("короткое: доходность посчитана не для показанной цены быстрой продажи", sm)
+    if c_ and not c_["final"] and m_roi:
+        fail("короткое: процент доходности при неизвестной цене ремонта (выдуман)", sm)
     # ---- решение ----
     if sev >= 3 and code != "skip":
         fail("критичный дефект без отказа", code, facts["defects"])

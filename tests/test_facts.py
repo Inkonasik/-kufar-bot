@@ -1,7 +1,6 @@
 """Тесты разбора объявления по правилам: память, состояние, дефекты, батарея, торг, комплект."""
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 os.environ.update(TG_TOKEN="t", TG_CHAT_ID="1")
@@ -93,6 +92,17 @@ f = k.rule_facts(ad("iPhone 7", cond="Б/у"))
 check("серьёзность без дефектов = -1", k.max_severity(f["defects"]) == -1)
 f = k.rule_facts(ad("iPhone SE 2020", "договорная"))
 check("договорная", f["negotiable_price"] is True and f["label"] == "iPhone SE (2020)", f["label"])
+
+# Живое объявление Куфара №1092084286 (29.10.2026, первые 123 символа описания дословно): «экран … не оригинал» со словами между
+REAL = "Телефон остносительно хороший проблем по работе нету акб 82% экран весь в царапинах не оригинал задняя камера фейс работает"
+fr = k.rule_facts(ad("iPhone 12 128gb", REAL))
+check("живой текст: «экран весь в царапинах не оригинал» → экран не оригинал + царапины, АКБ 82%",
+      "screen_replaced" in fr["defects"] and "cosmetic" in fr["defects"] and fr["battery_pct"] == 82, (fr["defects"], fr["battery_pct"]))
+for txt, want in (("экран родной, аккумулятор не оригинал", False), ("экран и корпус не оригинал", False),
+                  ("экран без царапин, не оригинальная зарядка", False), ("дисплей заменен", True), ("экран не оригинал", True),
+                  ("экран после падения заменен", True), ("экран целый, стекло камеры не оригинал", False)):
+    got = "screen_replaced" in k.find_defects(txt)
+    check(f"экран не оригинал / заменён: «{txt}» → {want}", got == want, k.find_defects(txt))
 
 print("итого ошибок (разбор):", bad)
 sys.exit(1 if bad else 0)

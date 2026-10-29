@@ -43,6 +43,8 @@ iPhone 12 и новее, Galaxy S10 и новее, планшеты, чехлы/
   MARKET_TTL_HOURS   как часто обновлять аналоги по модели, часов (6)
   MARKET_MAX_REFRESH сколько моделей обновлять за один запуск (6)
   MARKET_SIZE        сколько объявлений-аналогов запрашивать по модели (100)
+  MARKET_ROTATE      сбор рынка (процесс B): сколько моделей, дольше всего не обновлявшихся, обновлять за запуск — уже ПОСЛЕ
+                     уведомлений, если осталось время (2). Так база копит активные аналоги, даже если свежих объявлений модели нет
   MIN_COMPS          меньше стольких аналогов — оценка «приблизительная», вывод «пока недостаточно данных» (5; для аналогов с таким же дефектом — 3)
   TARGET_PROFIT_BYN  целевая ЧИСТАЯ прибыль на одну сделку, BYN. Не задана — берётся большее из MIN_PROFIT_BYN и MIN_PROFIT_PCT %
   MIN_PROFIT_BYN     минимальная целевая прибыль на сделку, BYN (15)
@@ -79,6 +81,13 @@ iPhone 12 и новее, Galaxy S10 и новее, планшеты, чехлы/
   MARKET_ACTIVE_DAYS запись считается активной, если объявление видели в выдаче не позже стольких дней назад (3). В ТЕКУЩУЮ оценку цены
                      идут только активные записи (и свежая выдача); более старые — только в отдельную историческую сводку
   MESSAGE_STYLE      short (по умолчанию) — короткое сообщение; full — подробный разбор, как раньше
+Поправка прогноза по накопленной истории (это статистика наблюдений, не обучение нейросети):
+  CALIB_MIN_ADS      сколько объявлений, наблюдавшихся 3+ дня, нужно для поправки по истории цен (30). Поправка — средняя доля
+                     «последняя цена / первая цена» (только вниз, не ниже ×0.80): объявления дешевеют — ожидаемая продажа ниже
+  CALIB_MIN_DEALS    сколько подтверждённых сделок из deals.json нужно для поправки по сделкам (5): медиана «фактическая цена
+                     продажи / первый прогноз бота», ×0.70…×1.15; приоритетнее истории цен
+  deals.json         подтверждённые сделки (заполняешь сам; бот только читает): [{"date": "2026-11-02", "ad_id": 1091950734,
+                     "model": "iPhone X", "mem": 64, "buy_price": 120, "repair": 0, "costs": 5, "sell_price": 180}]
 """
 import base64
 import copy
@@ -141,7 +150,7 @@ STATE = {"market": {}, "baseline": [], "notice": 0, "pending": {}, "marks": {}} 
 # очередь повторов, метки номеров для защиты от поднятых объявлений (см. originality)
 # состояние текущего запуска: крайнее время, счётчики запросов карточек; db_comps — сколько аналогов добавила база рынка;
 # no_photo / no_refresh — на фото или обновление аналогов уже нет времени до конца «окна свежести»
-RUN = {"deadline": 0.0, "cards": 0, "card_fails": 0, "img_fails": 0, "db_comps": 0, "no_photo": False, "no_refresh": False,
+RUN = {"deadline": 0.0, "cards": 0, "card_fails": 0, "img_fails": 0, "db_comps": 0, "db_ids": set(), "no_photo": False, "no_refresh": False,
        "ad_until": None}  # ad_until — до какого момента объявление ещё свежее (ограничивает ожидание нейросети и фото)
 
 
@@ -172,6 +181,7 @@ def _env_range(name, default, lo, hi):
 MARKET_TTL_H = _env_float("MARKET_TTL_HOURS", 6)      # через сколько часов обновлять кеш аналогов
 MARKET_MAX_REFRESH = int(_env_float("MARKET_MAX_REFRESH", 6))  # сколько моделей обновлять за один запуск
 MARKET_SIZE = int(_env_float("MARKET_SIZE", 100))      # сколько объявлений-аналогов запрашивать по модели
+MARKET_ROTATE = int(_env_range("MARKET_ROTATE", 2, 0, 10))  # процесс B: сколько моделей обновлять за запуск ПОСЛЕ уведомлений
 MIN_COMPS = int(_env_float("MIN_COMPS", 5))            # меньше аналогов — оценка «приблизительная», вывод «пока недостаточно данных»
 MIN_PROFIT_BYN = _env_float("MIN_PROFIT_BYN", 15)      # целевая прибыль на сделку перепродажи, BYN
 MIN_PROFIT_PCT = _env_float("MIN_PROFIT_PCT", 12)      # …или столько процентов от цены быстрой продажи (берётся большее)
@@ -1207,7 +1217,7 @@ DEFECT_RULES = [
     ("camera", r"камер\w*\s+(?:не\s+работа\w+|не\s+фокусир\w+|размыт\w*|разбит\w*|треснул\w*)|пятн\w+\s+на\s+камер\w*", "проблемы с камерой", 2),
     ("comms", r"(?:wi-?fi|вай-?фай|bluetooth|блютуз|микрофон|динамик|nfc|gps|сеть|связь|сим\w*|sim)\s+(?:не\s+работа\w+|не\s+видит|не\s+ловит|пропада\w+|хрипит|сломан\w*)|нет\s+(?:сети|звука|связи)", "проблемы со связью/звуком", 2),
     ("battery", r"(?:акб|аккумулятор\w*|батаре\w*)\s+(?:слаб\w+|быстро\s+(?:садится|разряжа\w+)|не\s+держит|вздул\w+|умира\w+|требуется\s+замен\w+|на\s+замен\w+|изношен\w+)|быстро\s+(?:садится|разряжается)|вздут\w+\s+(?:акб|аккумулятор\w*|батаре\w*)", "слабый аккумулятор", 1),
-    ("screen_replaced", r"(?:замен\w+|менян\w+|менял\w*|не\s+оригинал\w*|копи\w+|китайск\w+)\s+(?:экран\w*|дисплей\w*|стекл\w*)|(?:экран\w*|дисплей\w*)\s+(?:заменен\w*|не\s+оригинал\w*|копия)", "экран заменён/не оригинал", 1),
+    ("screen_replaced", r"(?:замен\w+|менян\w+|менял\w*|не\s+оригинал\w*|копи\w+|китайск\w+)\s+(?:экран\w*|дисплей\w*|стекл\w*)|(?:экран\w*|дисплей\w*)(?:\s+(?!(?:акб|аккумулятор|батаре|корпус|крышк|камер|рамк|стекл|зарядк|кабел)\w*)[^\s.,;:!?()]+){0,4}?\s+(?:заменен\w*|не\s+оригинал\w*|копия)", "экран заменён/не оригинал", 1),
     ("repaired", r"(?:был\w*\s+)?(?:после\s+ремонта|ремонтировал\w*|вскрывал\w*|паян\w+)", "был ремонт/вскрывался", 1),
     ("cosmetic", r"царапин\w*|потертост\w*|потёртост\w*|скол\w*|вмятин\w*|помят\w*|следы\s+использования", "косметические следы", 0),
     ("parts", r"на\s+запчаст\w*|на\s+детал\w*|на\s+разбор|донор|на\s+з/ч", "на запчасти", 3),
@@ -1301,7 +1311,8 @@ def kit_from_text(text):
 
 
 def ad_description(ad):
-    for key in ("body_short", "body", "description", "text"):
+    """Описание объявления: ПОЛНЫЙ текст (body — из карточки), а короткий фрагмент из выдачи (body_short) — только если полного нет."""
+    for key in ("body", "description", "text", "body_short"):
         v = ad.get(key)
         if isinstance(v, str) and v.strip():
             return " ".join(v.split())[:2000]
@@ -1657,8 +1668,46 @@ def merge_photos(facts, ph):
     out["kit"] = [x for x in kit if x in PHOTO_KIT] if isinstance(kit, list) else []
     out["mismatch"] = str(ph.get("mismatch") or "")[:140]
     out["quality"] = str(ph.get("quality") or "")[:20]
-    # Фото-наблюдения показываем отдельно, но не превращаем автоматически в дефекты для расчёта цены.
-    # Так ошибочная визуальная догадка модели не меняет рекомендацию без подтверждения продавцом.
+
+
+# Видимый дефект на фото → код дефекта для расчёта. «other» (что-то непонятное) в расчёт не идёт, только снижает уверенность.
+PHOTO_DEFECT = {"screen": "screen", "camera": "camera", "cosmetic": "cosmetic", "opened": "repaired"}
+_PHOTO_RESTATE = re.compile(r"по\s+описани\w*|со\s+слов|продав\w+\s+(?:пиш|указ|сообщ)\w*|в\s+(?:тексте|описании)|указан\w*\s+в", re.I)
+
+
+def apply_photo_evidence(facts):
+    """Находки на фото → в расчёт. Три уровня доказанности (отдельно хранится, что сказал продавец, а что видно на фото):
+      • подтверждено фото — видимый дефект с уверенностью «высокая» на фото не плохого качества: идёт в дефекты расчёта
+        (категория аналогов, ремонт, максимальная цена покупки) с пометкой «по фото»; если продавец сам назвал этот дефект —
+        учитывается ОДИН раз (источник «текст+фото»);
+      • возможно — средняя/низкая уверенность или плохие фото: цену не меняет, но снижает уверенность оценки;
+      • пересказ текста («по описанию продавца…») — не наблюдение по фото, отбрасывается.
+    Отсутствие находок на фото НЕ делает телефон исправным: категория по-прежнему строится по тексту продавца.
+    Исправность функций (Face ID, камеры, аккумулятор) по фото не определяется — такие выводы нейросети здесь не принимаются."""
+    facts["defects_text"] = dict(facts["defects"])
+    facts["defect_src"] = {c: "текст" for c in facts["defects"]}
+    ph = facts.get("photo") or {}
+    if ph.get("status") != "analyzed":
+        return facts
+    usable = (ph.get("quality") or "").lower() != "плохое"
+    confirmed, possible = [], []
+    for f in ph.get("findings") or []:
+        if _PHOTO_RESTATE.search(f.get("what") or ""):
+            continue
+        code = PHOTO_DEFECT.get(f.get("kind"))
+        if code and f.get("conf") == "высокая" and usable:
+            confirmed.append((code, f))
+        else:
+            possible.append(f)
+    for code, f in confirmed:
+        if code in facts["defects"]:
+            facts["defect_src"][code] = "текст+фото"
+        else:
+            facts["defects"][code] = "по фото: " + f["what"]
+            facts["defect_src"][code] = "фото"
+    ph["confirmed"] = [{"code": c, "what": f["what"]} for c, f in confirmed]
+    ph["possible"] = [{"kind": f.get("kind"), "what": f["what"], "conf": f.get("conf")} for f in possible]
+    return facts
 
 
 def analyze_ad(ad):
@@ -1668,6 +1717,11 @@ def analyze_ad(ad):
         facts = merge_llm(facts, llm_analyze(ad, facts))
     except Exception as e:  # разбор не должен ронять мониторинг
         log("Ошибка разбора объявления:", e)
+    try:
+        apply_photo_evidence(facts)
+    except Exception as e:
+        log("Ошибка учёта фото, считаю только по тексту:", e)
+        facts["defects"] = dict(facts.get("defects_text") or facts["defects"])
     return facts
 
 
@@ -1870,11 +1924,26 @@ def refresh_market(label):
 
 def _merge_db(items, key, now):
     """Аналоги из свежей выдачи + АКТИВНЫЕ наблюдения из базы рынка (их цена — последняя увиденная), без повторов номеров.
-    Возвращает (список, сколько добавлено из базы)."""
-    have = {x[0] for x in items}
-    extra = [it for it in mdb_comps(key, now) if it[0] not in have]
-    merged = dedupe_items(list(items) + extra)
-    return merged, len(merged) - len(dedupe_items(list(items)))
+    Возвращает (список, сколько добавлено из базы).
+    Объявление есть и в кеше, и в базе — цена берётся из базы: база обновляется при каждом сборе выдачи и при каждой карточке,
+    поэтому её цена не старше кеша (кеш живёт до MARKET_TTL_HOURS и не знает, что продавец потом изменил цену). Если база знает
+    противоречие в характеристиках этого объявления (например, по карточке), оно не аналог — как и в mdb_comps."""
+    db_rows = {it[0]: it for it in mdb_comps(key, now)}
+    ads = _mdb_ads()
+    fixed = []
+    for it in items:
+        rec = ads.get(str(it[0]))
+        if rec and rec.get("key") == key and rec.get("conflicts"):
+            continue
+        row = db_rows.get(it[0])
+        if row and row[1] != it[1]:
+            it = [it[0], row[1]] + list(it[2:])
+        fixed.append(it)
+    have = {x[0] for x in fixed}
+    extra = [it for i, it in db_rows.items() if i not in have]
+    merged = dedupe_items(fixed + extra)
+    RUN["db_ids"] = {it[0] for it in extra} & {it[0] for it in merged}
+    return merged, len(merged) - len(dedupe_items(fixed))
 
 
 def market_items(label, now=None):
@@ -1885,7 +1954,7 @@ def market_items(label, now=None):
     key = market_key(label)
     entry = STATE["market"].get(key)
     age = (now - entry["t"]) if entry else None
-    RUN["db_comps"] = 0
+    RUN["db_comps"], RUN["db_ids"] = 0, set()
     if entry and age < MARKET_TTL_H * 3600:
         items, RUN["db_comps"] = _merge_db(entry["items"], key, now)
         return items, age, False, None
@@ -1905,10 +1974,15 @@ def market_items(label, now=None):
     if entry and age <= MARKET_ACTIVE_DAYS * 86400:  # кеш старше окна активности — уже не текущие предложения
         items, RUN["db_comps"] = _merge_db(entry["items"], key, now)
         return items, age, True, None
-    db = mdb_comps(key, now)
+    db = dedupe_items(mdb_comps(key, now))
     if len(db) >= REF_MIN:
-        RUN["db_comps"] = len(db)
-        return dedupe_items(db), None, True, None
+        # возраст выборки — медиана давности последних наблюдений её записей (не самая свежая запись: одна свежая не делает
+        # свежей всю выборку). last_seen неизменившихся записей обновляется раз в MDB_TOUCH_S, так что возраст может быть
+        # завышен, но не занижен. Старше MARKET_TTL_HOURS — оценка помечается как по устаревшим аналогам.
+        ads_ = _mdb_ads()
+        db_age = max(0.0, statistics.median(now - int((ads_.get(str(it[0])) or {}).get("last_seen") or 0) for it in db))
+        RUN["db_comps"], RUN["db_ids"] = len(db), {it[0] for it in db}
+        return db, db_age, db_age >= MARKET_TTL_H * 3600, None
     return None, None, False, reason
 
 
@@ -2281,7 +2355,11 @@ def deal_calc(quick, lst, price, rep=None, rep_unknown=(), reserve_on=True):
          "raw": quick - costs - target, "desired": floor5(quick - costs - DESIRED_MARGIN * target),
          "limit": floor5(quick - costs - target), "walk": floor5(lst - costs_opt)}
     if price:
+        # Доходность на вложенные деньги = предполагаемая чистая прибыль / всё вложенное × 100 %, где вложено = цена покупки
+        # + расходы (прочие, ремонт с запасом, резерв). Основной (показываемый) сценарий — консервативный: покупка по цене
+        # продавца, продажа по цене для быстрой продажи; profit и roi считаются для ОДНОЙ и той же цены покупки и продажи.
         c["profit"], c["profit_opt"] = quick - price - costs, lst - price - costs_opt
+        c["invested"] = price + costs
         c["roi"] = c["profit"] / (price + costs) if price + costs > 0 else None
         c["roi_opt"] = c["profit_opt"] / (price + costs_opt) if price + costs_opt > 0 else None
         c["gap"] = c["limit"] - price  # запас до максимальной цены (минус — цена выше)
@@ -2317,10 +2395,13 @@ def build_plan(ad, facts, snap, clean, like):
     plan = {"unconfirmed": unconf, "asis": asis, "repair": rp, "crit": crit, "A": None, "B": None, "best": None, "breakeven": None,
             "sens": [], "upper": None}
     reserve_on = bool(unconf)
+    cal = calibration(market_key(facts["label"])) if market_query(facts["label"]) else {"factor": 1.0, "src": "none", "text": ""}
+    f_ = cal["factor"]
+    plan["calib"] = cal  # поправка по накопленной истории/сделкам (1.0 — данных мало, расчёт по текущим аналогам как есть)
     if asis:
-        plan["A"] = deal_calc(asis["quick"], asis["list"], price, None, (), reserve_on)
+        plan["A"] = deal_calc(floor5(asis["quick"] * f_), rnd5(asis["list"] * f_), price, None, (), reserve_on)
     if rp["needs"] and not crit and clean and clean["st"]:
-        cq, cl = floor5(clean["st"]["q1"]), rnd5(clean["st"]["med"])
+        cq, cl = floor5(clean["st"]["q1"] * f_), rnd5(clean["st"]["med"] * f_)
         known = (rp["lo"], rp["hi"]) if rp["items"] else None
         plan["B"] = deal_calc(cq, cl, price, known, rp["unknown"], True)
         plan["B"]["clean_n"] = clean["st"]["n"]
@@ -2333,7 +2414,7 @@ def build_plan(ad, facts, snap, clean, like):
                     plan["sens"].append((r, deal_calc(cq, cl, price, (float(r), float(r)), (), True)["limit"]))
     if not plan["A"] and not plan["B"] and not crit and clean and clean["st"]:
         # состояние телефона оценить не из чего, но продать дороже исправного он не сможет: считаем только верхнюю границу
-        plan["upper"] = deal_calc(floor5(clean["st"]["q1"]), rnd5(clean["st"]["med"]), price, None, (), reserve_on)
+        plan["upper"] = deal_calc(floor5(clean["st"]["q1"] * f_), rnd5(clean["st"]["med"] * f_), price, None, (), reserve_on)
     best = None
     if plan["A"]:
         best = "A"
@@ -2477,7 +2558,10 @@ def _source_conf(res, facts, plan, clean, pool, st, snap, sev):
         sst, spool, tier, need = st, pool["items"], pool["tier"], pool["need"]
     elif asis and asis["src"] in ("cat", "ok"):
         row = snap["rows"][asis["cat"]]
-        sst, spool, tier, need = row["st"], row["items"], "T4" if row["mixed"] else "T2", SNAP_NEED
+        # «исправные» (ok) — это обычная выборка исправных телефонов: для неё, как и для общего рынка, нужно MIN_COMPS аналогов;
+        # пониженный порог SNAP_NEED (3) допустим только для категорий с дефектами, где аналогов обычно мало
+        sst, spool, tier = row["st"], row["items"], "T4" if row["mixed"] else "T2"
+        need = MIN_COMPS if asis["src"] == "ok" else SNAP_NEED
     else:
         sst, spool = None, []
     why = []
@@ -2512,6 +2596,17 @@ def _source_conf(res, facts, plan, clean, pool, st, snap, sev):
             conf = "средняя"
     if not facts["mem"]:
         why.append("память не указана")
+    ph = facts.get("photo") or {}
+    if ph.get("status") == "analyzed":
+        if ph.get("mismatch"):  # фото противоречат словам продавца — уверенного вывода не даём
+            why.append("фото расходятся с описанием")
+            conf = "низкая"
+        if any(v == "фото" for v in (facts.get("defect_src") or {}).values()):
+            why.append("дефект виден на фото, продавец о нём не пишет")
+            conf = "средняя" if conf == "высокая" else conf
+        if ph.get("possible"):
+            why.append("на фото возможен дефект: " + ph["possible"][0]["what"])
+            conf = "средняя" if conf == "высокая" else conf
     if facts.get("conflicts"):  # противоречия в характеристиках: уверенного вывода не даём
         why.append("противоречие: " + facts["conflicts"][0])
         conf = "низкая"
@@ -2540,9 +2635,10 @@ def _appraise(ad, facts, now=None):
             res["status"], res["no_market_reason"] = "no_market", why
             return res
         res["age_h"], res["stale"] = (age / 3600 if age is not None else None), stale
-        res["db_comps"] = RUN.get("db_comps", 0)
-        res["history"] = mdb_history(market_key(facts["label"]), facts["mem"], now)  # отдельно: в расчёт не входит
         ad_id = int(ad["ad_id"])
+        res["db_comps"] = len((RUN.get("db_ids") or set()) - {ad_id})  # само объявление (оно уже в базе) аналогом себе не считается
+        res["history"] = mdb_history(market_key(facts["label"]), facts["mem"], now)  # отдельно: в расчёт не входит
+        res["market"] = market_stats(market_key(facts["label"]), facts["mem"], now, exclude=ad_id)  # сводка по базе
         price, sev = facts["price"], max_severity(facts["defects"])
         if facts["label"] == "iPhone SE":  # поколение не указано — цены поколений сильно отличаются
             by_gen = {}
@@ -2875,7 +2971,7 @@ def photo_lines(facts, ap, compact=False):
     if ph.get("mismatch"):
         out.append(f"      ⚠ Расхождение с описанием: {e(ph['mismatch'])}")
     if any(f.get("kind") in ("screen", "cosmetic", "camera") and f.get("conf") in ("высокая", "средняя") for f in finds):
-        out.append("      ℹ Визуальные наблюдения не меняют расчёт цены автоматически — подтверди дефект у продавца.")
+        out.append("      ℹ В расчёт идёт только то, что видно уверенно; остальное снижает уверенность — подтверди у продавца.")
     return out
 
 
@@ -2975,6 +3071,12 @@ def market_block(facts, ap, compact=False):
             out.append(f"   ({snap['undefined']} объявлений из старого кеша без вида дефекта в расчёт категорий не вошли)")
         if ap.get("stale") and ap.get("age_h") is not None:
             out.append(f"   ⚠ аналоги обновлялись {ap['age_h']:.0f} ч назад (свежие загрузить не удалось)")
+        cal = (ap.get("plan") or {}).get("calib") or {}
+        if cal.get("text"):
+            out.append(f"   Поправка прогноза: {e(cal['text'])}.")
+        ms = ap.get("market") or {}
+        if ms.get("weekly"):
+            out.append("   По неделям (медианы цен объявлений): " + "; ".join(f"{w} — {money(v['med'])} ({v['n']})" for w, v in ms["weekly"].items()) + ".")
         h = ap.get("history")
         if h:
             out.append(f"   История (уже неактивные предложения, в расчёт не входят): {h['n']} шт., медиана {money(h['med'])} BYN"
@@ -3288,8 +3390,16 @@ def short_verdict(facts, ap):
     return "⚪", "НЕДОСТАТОЧНО ДАННЫХ", short_reason(facts, ap)
 
 
-def short_risk(facts, ap):
-    """Одна строка о риске, который способен полностью изменить расчёт (или None)."""
+def _profit_text(lo, hi):
+    if lo >= 0:
+        return f"около {rng(lo, hi)} BYN"
+    return f"от {signed(lo)} до {signed(hi)} BYN"
+
+
+def short_caution(facts, ap):
+    """Одна строка-оговорка для ИТОГА — только то, что прямо меняет доверие к решению (или None): цену не удалось сверить
+    со страницей, цены расходятся, характеристики противоречат друг другу, фото противоречат описанию, цена подозрительно низкая.
+    Отдельного списка рисков, раздела «по описанию» или «по фото» нет: эти данные уже учтены в цифрах и уверенности."""
     e = html.escape
     pc = facts.get("price_conflict")
     if pc:
@@ -3305,24 +3415,21 @@ def short_risk(facts, ap):
         return "⚠️ Противоречие: " + e(facts["conflicts"][0]) + " — уверенность снижена."
     ph = facts.get("photo") or {}
     if ph.get("status") == "analyzed" and ph.get("mismatch"):
-        return "⚠️ Фото расходится с описанием: " + e(ph["mismatch"])
+        return "⚠️ Фото расходится с описанием: " + e(ph["mismatch"]) + " — уверенность снижена."
     clean_st = (ap.get("clean") or {}).get("st")
     if facts["price"] and clean_st and facts["price"] < 0.5 * clean_st["med"] and max_severity(facts["defects"]) < 2:
         return "⚠️ Цена вдвое ниже рынка — проверь блокировку iCloud/аккаунта и продавца."
-    if ap.get("status") == "ok" and not facts["desc"]:
-        return "⚠️ Описания нет — дефекты могли не указать, открой объявление."
     return None
 
 
-def _profit_text(lo, hi):
-    if lo >= 0:
-        return f"около {rng(lo, hi)} BYN"
-    return f"от {signed(lo)} до {signed(hi)} BYN"
-
-
 def build_short_message(ad, facts, ap):
-    """📱 модель · 💰 цена продавца · 📍 регион / 📊 перепродажа · ⚡ быстрая продажа · 💸 максимум · 🎯 желательно · 📈 прибыль /
-    вердикт (ВЫГОДНО / НЕВЫГОДНО / НЕДОСТАТОЧНО ДАННЫХ) · уверенность · одно предупреждение · ссылка."""
+    """Короткое уведомление — три раздела:
+      РЫНОК   — перепродажа (диапазон), цена для быстрой продажи, число сопоставимых объявлений;
+      ПОКУПКА — желательная и максимальная цена покупки, предполагаемая прибыль после расходов, доходность на вложенные деньги;
+      ИТОГ    — решение одной строкой (с уверенностью) и ссылка.
+    Прибыль и доходность — для одного сценария: покупка по цене продавца, продажа по цене для быстрой продажи
+    (доходность = прибыль / (цена покупки + расходы) × 100 %). Если цена ремонта или цена продавца не известны — процент не
+    показывается (не выдумываем). Факты из описания и фото в сообщение отдельно не выводятся — они уже учтены в расчёте."""
     e = html.escape
     price = facts["price"]
     head = facts["label"] if facts["label"] != "Другое" else (ad.get("subject") if isinstance(ad.get("subject"), str) else "") or "Телефон"
@@ -3332,62 +3439,69 @@ def build_short_message(ad, facts, ap):
     usd = price_usd(ad)
     if facts.get("currency") == "USD" and usd:
         cur = f" (продавец указал цену в $: {money(usd)})"  # страница показывает рубли по курсу Куфара — их и считаем
-    lines = [f"📱 <b>{e(head)}</b>",
-             "💰 Цена продавца: " + (f"{money(price)} BYN{cur}" if price else "не указана — нужно уточнить"),
-             f"📍 {e(facts['region'] or 'регион не указан')}" + (" · магазин" if facts["seller"] == "магазин" else "")]
-    defects = [n for _c, n in sorted(facts["defects"].items(), key=lambda kv: -SEVERITY.get(kv[0], 0)) if SEVERITY.get(_c, 0) >= 1]
-    if defects:
-        lines.append("🔧 По описанию: " + e("; ".join(defects[:3])))
+    where = e(facts["region"] or "регион не указан") + (" · магазин" if facts["seller"] == "магазин" else "")
+    lines = [f"📱 <b>{e(head)}</b> · {where}",
+             "Цена продавца: " + (f"{money(price)} BYN{cur}" if price else "не указана — нужно уточнить")]
     best, c = _shown_variant(ap)
     plan = ap.get("plan") or {}
+    st = ap.get("stats") or {}
+    lines += ["", "<b>РЫНОК</b>"]
     if ap.get("status") == "ok" and c:
         after = " после ремонта" if best == "B" else ""
-        # верхняя граница — верхняя четверть цен ТЕХ ЖЕ аналогов, по которым посчитан показанный вариант (у расчёта между
-        # категориями своих аналогов нет — показываем одно число)
+        # верхняя граница — верхняя четверть цен ТЕХ ЖЕ аналогов, по которым посчитан показанный вариант
         src_st = ((ap.get("clean") or {}).get("st") if best == "B" else (plan.get("asis") or {}).get("st")) or {}
         hi = rnd5(src_st["q3"]) if src_st.get("q3") and rnd5(src_st["q3"]) > c["list"] else c["list"]
-        lines += ["", f"📊 Перепродажа{after}: {rng(c['list'], hi)} BYN", f"⚡ Быстрая продажа: около {money(c['quick'])} BYN"]
+        notes = ["цены объявлений, не сделок"]
+        asis = plan.get("asis") or {}
+        if asis.get("src") in ("cat", "interp") and best == "A":
+            notes.append("расчёт приблизительный")
+        cal = plan.get("calib") or {}
+        if cal.get("src") in ("drift", "deals") and abs(cal["factor"] - 1) >= 0.005:
+            notes.append((f"поправка по сделкам {(cal['factor'] - 1) * 100:+.0f}%" if cal["src"] == "deals"
+                          else f"поправка по истории цен {(cal['factor'] - 1) * 100:+.0f}%").replace("-", "−"))
+        lines += [f"Перепродажа{after}: {rng(c['list'], hi)} BYN",
+                  f"Цена для быстрой продажи: {money(c['quick'])} BYN",
+                  f"Сопоставимых объявлений: {st.get('n') or 0} ({'; '.join(notes)})"]
+        lines += ["", "<b>ПОКУПКА</b>"]
         if c["limit"] <= 0:
-            lines.append("💸 Максимум покупки: не окупается при любой цене")
+            lines.append("Максимальная цена покупки: не окупается при любой цене")
         else:
-            lines.append(f"💸 Максимум покупки: {money(c['limit'])} BYN" + (" (до ремонта)" if not c["final"] else ""))
-            lines.append(f"🎯 Желательно купить за: {money(max(0, c['desired']))} BYN")
+            lines.append(f"Желательно купить за: {money(max(0, c['desired']))} BYN")
+            lines.append(f"Максимальная цена покупки: {money(c['limit'])} BYN" + (" (до вычета ремонта)" if not c["final"] else ""))
         if price and "profit" in c:
-            lo, hi_p = sorted((c["profit"], c["profit_opt"]))
-            roi = ""
-            if c.get("roi") is not None and c.get("roi_opt") is not None:
-                r_lo, r_hi = sorted((c["roi"] * 100, c["roi_opt"] * 100))
-                roi = f" (ROI {r_lo:+.0f}…{r_hi:+.0f}%)".replace("-", "−")
-            lines.append(f"📈 Прибыль после расходов: {_profit_text(lo, hi_p)}{roi}" + (" — до вычета ремонта" if not c["final"] else ""))
+            tail = " — до вычета ремонта" if not c["final"] else ""
+            lines.append(f"Предполагаемая прибыль после расходов: {signed(c['profit'])} BYN{tail}")
+            if c["final"] and c.get("roi") is not None:
+                lines.append(f"Доходность на вложенные деньги: {c['roi'] * 100:+.0f}%".replace("-", "−")
+                             + f" (вложено {money(c['invested'])} BYN: покупка за {money(price)}, расходы {money(c['costs'])};"
+                             + f" продажа за {money(c['quick'])} BYN)")
+            else:
+                lines.append("Доходность на вложенные деньги: не посчитать — неизвестна цена ремонта")
         elif not price:
-            lines.append("📈 Прибыль: цену нужно уточнить")
+            lines.append("Прибыль и доходность: нужно уточнить цену у продавца")
         rp = plan.get("repair") or {}
         be = plan.get("breakeven")
         if rp.get("unknown") and be is not None and best == "A":
-            lines.append(f"🔧 Ремонт ({e(', '.join(rp['unknown']))}) имеет смысл, если обойдётся не дороже ≈ {money(max(0, be))} BYN")
-        elif c and not c["final"] and price and c["limit"] > price:
+            lines.append(f"Ремонт ({e(', '.join(rp['unknown']))}) имеет смысл, если обойдётся не дороже ≈ {money(max(0, be))} BYN")
+        elif not c["final"] and price and c["limit"] > price:
             room = floor5((c["limit"] - price) / (1 + REPAIR_OVERRUN_PCT / 100))
-            lines.append(f"🔧 Ремонт ({e(', '.join(c['rep_unknown']))}) должен уложиться в ≈ {money(room)} BYN")
-    icon, verdict, why = short_verdict(facts, ap)
-    lines.append("")
-    if verdict == "ВЫГОДНО":
-        cond = ", если дефекты не обнаружатся" if (plan.get("unconfirmed") or not facts["desc"]) else ""
-        lines.append(f"{icon} <b>{verdict}</b>{cond}")
+            lines.append(f"Ремонт ({e(', '.join(c['rep_unknown']))}) должен уложиться в ≈ {money(room)} BYN")
     else:
-        lines.append(f"{icon} <b>{verdict}</b>")
-        if why:
-            lines.append(("Причина: " if verdict.startswith("НЕДОСТАТОЧНО") else "") + e(why[:1].upper() + why[1:] if verdict.startswith("НЕВЫГОДНО") else why))
-    st = ap.get("stats") or {}
-    if ap.get("conf") and st.get("n") and not _crit(facts):  # при критичном дефекте аналоги исправных к решению отношения не имеют
-        approx = ""
-        asis = plan.get("asis") or {}
-        if asis.get("src") in ("cat", "interp") and best == "A":
-            approx = ", расчёт приблизительный"
-        lines.append(f"Уверенность: {ap['conf']} · {n_comps(st['n'])} (цены объявлений, не сделок{approx}).")
-    risk = short_risk(facts, ap)
-    if risk:
-        lines.append(risk)
-    lines += ["", "🔗 " + e(ad.get("ad_link") if isinstance(ad.get("ad_link"), str) and ad.get("ad_link") else item_url(ad["ad_id"]))]
+        lines.append(f"Сопоставимых объявлений: {st['n']} (цены объявлений, не сделок)" if st.get("n") else "Нет данных для оценки")
+        lines += ["", "<b>ПОКУПКА</b>", "Максимальную цену покупки посчитать не из чего"]
+        if not price:
+            lines.append("Прибыль и доходность: нужно уточнить цену у продавца")
+    icon, verdict, why = short_verdict(facts, ap)
+    lines += ["", "<b>ИТОГ</b>"]
+    cond = ", если дефекты не обнаружатся" if verdict == "ВЫГОДНО" and (plan.get("unconfirmed") or not facts["desc"]) else ""
+    conf = ap.get("conf") if (ap.get("conf") and st.get("n") and not _crit(facts)) else None
+    lines.append(f"{icon} <b>{verdict}</b>{cond}" + (f" · Уверенность: {conf}" if conf else ""))
+    if why and verdict != "ВЫГОДНО":
+        lines.append(("Причина: " if verdict.startswith("НЕДОСТАТОЧНО") else "") + e(why[:1].upper() + why[1:] if verdict.startswith("НЕВЫГОДНО") else why))
+    caution = short_caution(facts, ap)
+    if caution:
+        lines.append(caution)
+    lines.append("🔗 " + e(ad.get("ad_link") if isinstance(ad.get("ad_link"), str) and ad.get("ad_link") else item_url(ad["ad_id"])))
     return "\n".join(lines)
 
 
@@ -3410,6 +3524,9 @@ def build_message(ad, facts, ap):
 # Файл пишется по одной записи на строку и с сортировкой — так коммиты в git маленькие (меняются только строки изменённых записей).
 
 MARKET_DB_FILE = Path(__file__).with_name("market_history.json")
+MARKET_DB_BACKUP = Path(__file__).with_name("market_history.backup.json")  # копия раз в сутки (тоже сохраняется в репозитории)
+BACKUP_EVERY_S = 86400
+WEEKLY_KEEP = 26  # недель истории в сводке (живёт и после удаления старых записей)
 MDB = {"ok": True, "loaded": 0, "why": "", "data": {"version": 1, "ads": {}}}
 MDB_TOUCH_S = 6 * 3600  # last_seen у неизменившихся записей обновляется не чаще раза в 6 часов (маленькие коммиты)
 
@@ -3435,17 +3552,97 @@ def mdb_load():
         log("База рынка не читается, в этом запуске не сохраняю её:", e)
         return False
     try:
-        data = json.loads(text)
-        if not isinstance(data, dict) or not isinstance(data.get("ads"), dict):
-            raise ValueError("нет раздела ads")
+        data = _mdb_parse(text)
     except Exception as e:
+        backup = None
+        try:
+            backup = _mdb_parse(MARKET_DB_BACKUP.read_text(encoding="utf-8"))
+        except Exception:
+            backup = None
+        if backup is not None:  # основной файл испорчен, суточная копия цела: работаем с ней, при сохранении основной восстановится
+            log(f"База рынка {MARKET_DB_FILE.name} повреждена ({e}) — восстанавливаю из резервной копии {MARKET_DB_BACKUP.name} "
+                f"({backup.get('updated', 'дата неизвестна')}). Испорченная версия остаётся в истории git.")
+            backup["ads"] = {k: v for k, v in backup["ads"].items() if isinstance(v, dict)}
+            MDB.update(data=backup, loaded=len(backup["ads"]), why="восстановлена из резервной копии")
+            return True
         MDB.update(ok=False, why=f"повреждена: {e}")
-        log(f"База рынка {MARKET_DB_FILE.name} повреждена ({e}) — файл не трогаю и в этом запуске не перезаписываю. "
-            "Восстанови прошлую версию из истории git.")
+        log(f"База рынка {MARKET_DB_FILE.name} повреждена ({e}), резервной копии нет — файл не трогаю и в этом запуске не "
+            "перезаписываю. Восстанови прошлую версию из истории git.")
         return False
     data["ads"] = {k: v for k, v in data["ads"].items() if isinstance(v, dict)}
     MDB["data"], MDB["loaded"] = data, len(data["ads"])
     return True
+
+
+def _mdb_parse(text):
+    data = json.loads(text)
+    if not isinstance(data, dict) or not isinstance(data.get("ads"), dict):
+        raise ValueError("нет раздела ads")
+    return _sanitize_db(data)
+
+
+def _is_num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+_LT_OK = lambda v: isinstance(v, str) and parse_list_time(v) is not None  # noqa: E731
+_REC_SCHEMA = {  # поле -> проверка типа; поле, не прошедшее проверку, отбрасывается (лучше «не знаю», чем мусор в расчёте)
+    "first_seen": _is_num, "last_seen": _is_num, "last_check": _is_num,
+    "price_byn": lambda v: v is None or (_is_num(v) and v > 0), "mem_gb": lambda v: _is_num(v) and v > 0,
+    "price_hist": lambda v: isinstance(v, list), "price_raw": lambda v: isinstance(v, dict),
+    "list_time": _LT_OK, "first_list_time": _LT_OK,
+    "list_time_hist": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
+    "appraisals": lambda v: isinstance(v, list) and all(isinstance(x, dict) for x in v),
+    "forecast_checks": lambda v: isinstance(v, list) and all(isinstance(x, dict) for x in v),
+    "notify": lambda v: isinstance(v, dict) and isinstance(v.get("status"), str) and _is_num(v.get("t", 0)),
+    "comp": lambda v: isinstance(v, list) and len(v) == 5 and all(_is_num(x) for x in v),
+    "key": lambda v: isinstance(v, str) and bool(v),
+    "model": lambda v: isinstance(v, dict) and isinstance(v.get("label"), str),
+    "conflicts": lambda v: isinstance(v, list), "flags": lambda v: isinstance(v, list),
+    "defects": lambda v: isinstance(v, dict), "battery": lambda v: isinstance(v, dict) and _is_num(v.get("pct")),
+    "kit": lambda v: isinstance(v, dict) and isinstance(v.get("items"), list),
+    "publication": lambda v: isinstance(v, dict), "condition_cat": lambda v: isinstance(v, dict),
+    "price_conflict": lambda v: isinstance(v, dict), "price_card_invalid": lambda v: isinstance(v, dict),
+    "photo": lambda v: isinstance(v, dict), "has_desc": lambda v: isinstance(v, bool),
+    **{f: (lambda v: isinstance(v, str)) for f in ("title", "url", "status", "currency", "region", "area", "seller",
+                                                    "condition", "mem_src", "defects_src", "price_src", "list_time_raw")},
+}
+
+
+def _sanitize_db(data):
+    """Проверка типов при загрузке базы: записи — только словари; поле неверного типа (ручная правка, сбой) отбрасывается
+    и пишется в журнал. Так одно испорченное поле не ломает ни запись, ни запуск, а расчёт не получает мусор."""
+    ads, bad_fields, bad_recs = {}, 0, 0
+    for k_, rec in data["ads"].items():
+        if not isinstance(rec, dict) or not str(k_).isdigit():
+            bad_recs += 1
+            continue
+        clean = {}
+        for f, v in rec.items():
+            chk = _REC_SCHEMA.get(f)
+            if chk is None or chk(v):
+                clean[f] = v
+            else:
+                bad_fields += 1
+        ads[str(k_)] = clean
+    data["ads"] = ads
+    wk = data.get("weekly")
+    good_wk = {}
+    if isinstance(wk, dict):
+        for k_, ws in wk.items():
+            if isinstance(ws, dict):
+                ok_ws = {w: v for w, v in ws.items() if isinstance(v, dict) and _is_num(v.get("n")) and _is_num(v.get("med"))}
+                if ok_ws:
+                    good_wk[k_] = ok_ws
+    if wk is not None and good_wk != wk:
+        bad_fields += 1
+    data["weekly"] = good_wk
+    if "backup_t" in data and not _is_num(data["backup_t"]):
+        data["backup_t"] = 0
+        bad_fields += 1
+    if bad_fields or bad_recs:
+        log(f"База рынка: при загрузке отброшено испорченных полей {bad_fields}, записей {bad_recs} (остальное цело)")
+    return data
 
 
 def _mdb_ads():
@@ -3457,7 +3654,8 @@ def mdb_first_lt(ad_id):
     rec = _mdb_ads().get(str(ad_id))
     if not rec:
         return None
-    vals = [parse_list_time(x) for x in [rec.get("list_time")] + list(rec.get("list_time_hist") or [])]
+    lh = rec.get("list_time_hist") if isinstance(rec.get("list_time_hist"), list) else []
+    vals = [parse_list_time(x) for x in [rec.get("list_time")] + lh]
     vals = [v for v in vals if v is not None]
     return min(vals) if vals else None
 
@@ -3483,6 +3681,17 @@ def price_current(hist):
     if srch:
         return srch[1], "search"
     return None, None
+
+
+def price_change_times(hist, since=0):
+    """Моменты настоящих изменений цены (смена значения внутри одного источника) не раньше since. Первое наблюдение цены
+    из другого источника (карточка после выдачи) изменением не считается."""
+    out, last = [], {}
+    for t_, p_, s_ in price_hist_norm(hist):
+        if s_ in last and last[s_] != p_ and t_ >= since:
+            out.append(t_)
+        last[s_] = p_
+    return out
 
 
 def price_changes(hist):
@@ -3539,6 +3748,13 @@ def _mdb_observe(ad, comp, key, facts, now, checked):
     if price > 0:  # наблюдение без действительной цены не затирает известную цену и не считается её изменением
         same = [h for h in hist if h[2] == src]
         if not same or same[-1][1] != price:
+            if same and isinstance(rec.get("appraisals"), list) and rec["appraisals"] and isinstance(rec["appraisals"][-1], dict):
+                ap0 = rec["appraisals"][-1]  # настоящее изменение после нашей оценки — сравниваем с прогнозом
+                chk = {"t": now, "src": src, "price_before": same[-1][1], "price_after": price, "appraisal_t": ap0.get("t"),
+                       "predicted_resale": ap0.get("resale"), "predicted_quick": ap0.get("quick"), "max_buy": ap0.get("max_buy"),
+                       "note": "изменение цены объявления, не цена сделки"}
+                fc = rec.get("forecast_checks") if isinstance(rec.get("forecast_checks"), list) else []
+                rec["forecast_checks"] = (fc + [chk])[-5:]
             hist.append([now, price, src])
             changed = True
     if hist:
@@ -3559,12 +3775,15 @@ def _mdb_observe(ad, comp, key, facts, now, checked):
         iso = _iso(lt)
         old = rec.get("list_time")
         if old and old != iso:
-            lh = [x for x in (rec.get("list_time_hist") or []) if isinstance(x, str)]
-            if old not in lh:
+            lh = [x for x in (rec.get("list_time_hist") if isinstance(rec.get("list_time_hist"), list) else []) if isinstance(x, str)]
+            if isinstance(old, str) and old not in lh:
                 lh.append(old)
             rec["list_time_hist"] = lh[-5:]
             changed = True
         rec["list_time"] = iso
+        first_lt = parse_list_time(rec.get("first_list_time"))
+        if first_lt is None or first_lt > lt:  # нет или испорчено — заменяем действительной датой
+            rec["first_list_time"] = iso  # самое раннее увиденное размещение (не обязательно первая публикация — API её не даёт)
     elif ad.get("list_time") not in (None, ""):
         rec["list_time_raw"] = str(ad.get("list_time"))[:40]  # дата пришла, но не разобралась — храним как есть
     if facts is None:
@@ -3581,8 +3800,9 @@ def _mdb_observe(ad, comp, key, facts, now, checked):
             if v_:
                 rec[k_] = v_
         if facts["desc"] or "defects" not in rec:  # факты из текста: описание надёжнее одного заголовка
-            if facts["defects"]:
-                rec["defects"], rec["defects_src"] = dict(facts["defects"]), "текст продавца"
+            text_defects = facts.get("defects_text", facts["defects"])  # в базе — только слова продавца; фото — в rec["photo"]
+            if text_defects:
+                rec["defects"], rec["defects_src"] = dict(text_defects), "текст продавца"
             elif facts["desc"]:
                 rec.pop("defects", None)
                 rec["defects_src"] = "текст продавца: дефекты не названы (это не подтверждение исправности)"
@@ -3598,6 +3818,13 @@ def _mdb_observe(ad, comp, key, facts, now, checked):
             else:
                 rec.pop("conflicts", None)
             rec["has_desc"] = bool(facts["desc"]) or rec.get("has_desc", False)
+            cat = ad_cat(facts) or "unk"
+            cconf = ("низкая" if facts.get("conflicts") or cat == "unk" or not facts["desc"]
+                     else "средняя")  # слова продавца, а не проверка: «высокой» уверенность по тексту не бывает
+            by_photo = any(v == "фото" for v in (facts.get("defect_src") or {}).values())
+            rec["condition_cat"] = {"cat": cat, "name": CAT_NAMES.get(cat, cat), "conf": cconf,
+                                    "src": "текст продавца" + ("" if facts["desc"] else " (только заголовок)")
+                                           + (" + дефект на фото (нейросеть, не проверка)" if by_photo else "")}
         if comp is None and facts["label"] != "Другое":
             try:
                 k2 = market_key(facts["label"])
@@ -3623,6 +3850,16 @@ def mdb_note(ad_id, status, why="", now=None):
     rec["notify"] = {"status": status, "t": int(now or time.time()), **({"why": why[:120]} if why else {})}
 
 
+def mdb_mark_publication(ad_id, ad, now=None):
+    """Публикация прошла проверки бота: list_time не старше FRESH_MAX_AGE_S и номер новее опорных (не поднятие).
+    Это лучшее доступное подтверждение — API Куфара даты первой публикации не отдаёт, поэтому так и записываем."""
+    rec = _mdb_ads().get(str(ad_id))
+    lt = parse_list_time(ad.get("list_time"))
+    if rec is not None and lt is not None and "publication" not in rec:
+        rec["publication"] = {"time": _iso(lt), "checked_at": int(now or time.time()),
+                              "basis": "свежий list_time + номер новее опорных объявлений; не дата первой публикации из API (её нет)"}
+
+
 def mdb_notified(ad_id):
     rec = _mdb_ads().get(str(ad_id)) or {}
     return (rec.get("notify") or {}).get("status") == "sent"
@@ -3644,13 +3881,21 @@ def mdb_appraisal(ad_id, facts, ap, now=None):
             row["history"] = {k_: ap["history"][k_] for k_ in ("n", "med", "changed")}
         if c:
             row.update(max_buy=c["limit"], desired=c["desired"], quick=c["quick"], resale=c["list"])
+        cal = plan.get("calib") or {}
+        if cal.get("src") and cal["src"] != "none":
+            row["calib"], row["calib_src"] = cal["factor"], cal["src"]
         if facts.get("price"):
             row["price"] = facts["price"]
-        rec["appraisals"] = ((rec.get("appraisals") or []) + [row])[-3:]
+        ms = ap.get("market") or {}
+        if ms.get("n") is not None:
+            row["market"] = {k_: ms.get(k_) for k_ in ("n", "med", "lo", "hi", "reliability", "drop_rate")}
+        prev_ap = rec.get("appraisals") if isinstance(rec.get("appraisals"), list) else []
+        rec["appraisals"] = (prev_ap + [row])[-5:]
         ph = facts.get("photo") or {}
         if ph.get("status") == "analyzed":  # только если запрос к нейросети с фото действительно состоялся
             rec["photo"] = {"t": int(now or time.time()), "n": ph.get("n", 0), "src": "фото (нейросеть), не проверка",
                             "findings": [{"what": f["what"], "conf": f["conf"]} for f in ph.get("findings") or []][:4],
+                            "confirmed": list(ph.get("confirmed") or [])[:4], "possible": list(ph.get("possible") or [])[:4],
                             "kit_visible": list(ph.get("kit") or [])}
             if rec.get("kit") and ph.get("kit"):
                 rec["kit"]["photo_confirmed"] = True
@@ -3765,9 +4010,22 @@ def mdb_save(now=None):
         return False
     tmp = MARKET_DB_FILE.with_name(MARKET_DB_FILE.name + ".tmp")
     try:
+        # недельная история: пересчитываем по текущим записям и сливаем с сохранённой (недели удалённых записей не пропадают)
+        weekly = MDB["data"].get("weekly") if isinstance(MDB["data"].get("weekly"), dict) else {}
+        for k_, ws in weekly_from_records(now).items():
+            cur = weekly.setdefault(k_, {})
+            for w, v in ws.items():
+                if w not in cur or v["n"] >= cur[w].get("n", 0):
+                    cur[w] = v
+        for k_ in list(weekly):
+            weekly[k_] = dict(sorted(weekly[k_].items())[-WEEKLY_KEEP:])
+        MDB["data"]["weekly"] = weekly
         mdb_prune(now)
         for rec in ads.values():
             _mdb_status(rec, now)
+        backup_due = now - int(MDB["data"].get("backup_t") or 0) >= BACKUP_EVERY_S
+        if backup_due:
+            MDB["data"]["backup_t"] = now
         head = {k: v for k, v in MDB["data"].items() if k != "ads"}
         head.update(version=1, updated=_iso(now), count=len(ads),
                     note="Наблюдения за объявлениями Куфара: цены объявлений (не сделок). Статус not_seen — не видно в выдаче, не «продано».")
@@ -3779,6 +4037,13 @@ def mdb_save(now=None):
         if len(check.get("ads") or {}) != len(ads):
             raise ValueError("записанный файл не совпадает с базой в памяти")
         os.replace(tmp, MARKET_DB_FILE)
+        if backup_due:  # суточная резервная копия — тем же проверенным текстом, тоже атомарно; её сбой основной файл не трогает
+            try:
+                btmp = MARKET_DB_BACKUP.with_name(MARKET_DB_BACKUP.name + ".tmp")
+                btmp.write_text(text, encoding="utf-8")
+                os.replace(btmp, MARKET_DB_BACKUP)
+            except OSError as e:
+                log("Резервная копия базы не записана (основной файл сохранён):", e)
         MDB["loaded"] = len(ads)
         return True
     except Exception as e:
@@ -3788,6 +4053,379 @@ def mdb_save(now=None):
         except OSError:
             pass
         return False
+
+
+# ---------- Накопленная история → поправка прогнозов и сводка рынка ----------
+# Это НЕ обучение нейросети: бот копит наблюдения (база рынка) и подтверждённые сделки пользователя (deals.json) и считает по ним
+# простую статистику. Поправка прогноза включается только при достаточном объёме данных и всегда видна в журнале и в оценке.
+
+DEALS_FILE = Path(__file__).with_name("deals.json")
+CALIB_MIN_ADS = int(_env_range("CALIB_MIN_ADS", 30, 5, 10000))    # объявлений с ≥3 днями наблюдения для поправки по истории цен
+CALIB_MIN_DEALS = int(_env_range("CALIB_MIN_DEALS", 5, 2, 1000))  # подтверждённых сделок для поправки по сделкам
+CALIB_OBS_DAYS = 3                                                  # сколько дней объявление должно наблюдаться, чтобы попасть в поправку
+CALIB_DRIFT_RANGE = (0.80, 1.00)  # поправка по истории только ВНИЗ: объявления дешевеют — ожидаемая продажа ниже цены объявления
+CALIB_DEALS_RANGE = (0.70, 1.15)  # по подтверждённым сделкам — в обе стороны, но в разумных пределах
+
+
+def load_deals():
+    """Подтверждённые сделки пользователя из deals.json (заполняет сам пользователь; бот файл только читает).
+    Формат — список: {"date": "2026-11-02", "ad_id": 1091950734, "model": "iPhone X", "mem": 64, "buy_price": 120,
+    "repair": 0, "costs": 5, "sell_price": 180}. Записи с ошибками пропускаются (и пишутся в журнал), прибыль считается сама."""
+    try:
+        data = json.loads(DEALS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log(f"{DEALS_FILE.name} не читается ({e}) — подтверждённые сделки не учитываю")
+        return []
+    out = []
+    for i, d in enumerate(data if isinstance(data, list) else []):
+        try:
+            sell, buy = float(d["sell_price"]), float(d.get("buy_price", 0))
+            repair, costs = float(d.get("repair", 0) or 0), float(d.get("costs", 0) or 0)
+            if not (sell > 0 and buy >= 0 and repair >= 0 and costs >= 0) or not all(map(math.isfinite, (sell, buy, repair, costs))):
+                raise ValueError("цены должны быть неотрицательными числами, sell_price > 0")
+            out.append({"date": str(d.get("date") or ""), "ad_id": int(d["ad_id"]) if d.get("ad_id") not in (None, "") else None,
+                        "model": str(d.get("model") or ""), "mem": int(d.get("mem") or 0), "buy_price": buy, "repair": repair,
+                        "costs": costs, "sell_price": sell, "profit": sell - buy - repair - costs})
+        except (KeyError, TypeError, ValueError) as e:
+            log(f"{DEALS_FILE.name}: сделка №{i + 1} пропущена ({e})")
+    return out
+
+
+def _first_last_same_source(hist):
+    """(первая, последняя) цена одного источника (карточка, если она наблюдалась дважды, иначе выдача) — сопоставимые наблюдения."""
+    hist = price_hist_norm(hist)
+    for src_ in ("card", "search"):
+        hs = [h for h in hist if h[2] == src_]
+        if hs:
+            return hs[0][1], hs[-1][1]
+    return None, None
+
+
+def drift_ratios(key=None, now=None):
+    """Отношения «последняя цена / первая цена» по объявлениям, которые наблюдались не меньше CALIB_OBS_DAYS дней.
+    Объявление без изменений даёт 1.0 — это тоже данные (продавцы не уступили)."""
+    now = now or time.time()
+    out = []
+    for rec in _mdb_ads().values():
+        if key and rec.get("key") != key:
+            continue
+        if not rec.get("key") or rec.get("conflicts"):
+            continue
+        fs, ls = int(rec.get("first_seen") or 0), int(rec.get("last_seen") or 0)
+        if ls - fs < CALIB_OBS_DAYS * 86400:
+            continue
+        first, last = _first_last_same_source(rec.get("price_hist"))
+        if first and last and first > 0:
+            out.append(last / first)
+    return out
+
+
+def calibration(key=None, now=None):
+    """Поправка к ожидаемой цене продажи. Приоритет: подтверждённые сделки (≥ CALIB_MIN_DEALS: медиана «цена продажи /
+    прогноз быстрой продажи бота») → наблюдённое снижение цен объявлений (≥ CALIB_MIN_ADS объявлений: средняя «последняя /
+    первая цена», только вниз) → нет данных (1.0). Сначала по модели, при нехватке данных — по всем моделям.
+    {factor, src, n, scope, text}. Детерминирована: одни и те же данные дают один и тот же результат."""
+    res = {"factor": 1.0, "src": "none", "n": 0, "scope": "", "text": "поправки нет: данных пока мало"}
+    deals = load_deals()
+    for scope_key, scope in ((key, "модель"), (None, "все модели")):
+        ratios = []
+        for d in deals:
+            rec = _mdb_ads().get(str(d["ad_id"])) if d["ad_id"] else None
+            d_key = market_key(d["model"]) if d["model"] else (rec or {}).get("key")
+            if scope_key and d_key != scope_key:
+                continue
+            aps = [a for a in (rec or {}).get("appraisals") or [] if a.get("quick")]
+            if aps:  # первая оценка бота (без поправки, которую тогда применяли) против фактической цены продажи
+                ratios.append(d["sell_price"] / (aps[0]["quick"] / (aps[0].get("calib") or 1.0)))
+        if len(ratios) >= CALIB_MIN_DEALS:
+            f = min(CALIB_DEALS_RANGE[1], max(CALIB_DEALS_RANGE[0], statistics.median(sorted(ratios))))
+            res = {"factor": round(f, 3), "src": "deals", "n": len(ratios), "scope": scope,
+                   "text": f"поправка по {len(ratios)} подтверждённым сделкам ({scope}): ×{f:.2f}"}
+            break
+    if res["src"] == "none":
+        for scope_key, scope in ((key, "модель"), (None, "все модели")):
+            ratios = drift_ratios(scope_key, now)
+            if len(ratios) >= CALIB_MIN_ADS:
+                f = min(CALIB_DRIFT_RANGE[1], max(CALIB_DRIFT_RANGE[0], sum(ratios) / len(ratios)))
+                res = {"factor": round(f, 3), "src": "drift", "n": len(ratios), "scope": scope,
+                       "text": f"поправка по истории цен {len(ratios)} объявлений ({scope}): ×{f:.2f}"
+                               + (" — цены объявлений в среднем не снижались" if f >= 0.995 else "")}
+                break
+    return res
+
+
+def _week(ts):
+    y, w, _d = datetime.fromtimestamp(ts, timezone.utc).isocalendar()
+    return f"{y}-W{w:02d}"
+
+
+def weekly_from_records(now=None):
+    """Недельная история цен по модели и памяти: {"iPhone X|64": {"2026-W44": {"n", "med"}}} — по наблюдённым ценам объявлений
+    (для каждого объявления — его последняя цена в эту неделю). Это цены предложения, не сделок."""
+    acc = {}
+    for rec in _mdb_ads().values():
+        if not rec.get("key") or rec.get("conflicts"):
+            continue
+        k_ = f"{rec['key']}|{(rec.get('comp') or [0, 0])[1] or 0}"
+        per_week = {}
+        for h in price_hist_norm(rec.get("price_hist")):
+            per_week[_week(h[0])] = h[1]
+        if rec.get("price_byn") and rec.get("last_seen"):
+            per_week.setdefault(_week(int(rec["last_seen"])), rec["price_byn"])
+        for w, pr in per_week.items():
+            acc.setdefault(k_, {}).setdefault(w, []).append(pr)
+    return {k_: {w: {"n": len(v), "med": statistics.median(v)} for w, v in ws.items()} for k_, ws in acc.items()}
+
+
+def market_stats(key, mem=0, now=None, exclude=None):
+    """Сводка рынка по модели (и памяти, если она известна) из базы: только АКТИВНЫЕ предложения для текущих цен,
+    отдельно — история. {n, med, lo, hi, by_cat, clean_vs_defect, regions, weekly, drop_rate, obs_days, reliability}."""
+    now = now or time.time()
+    act, drops, observed, durations = [], 0, 0, []
+    for k_, rec in _mdb_ads().items():
+        if rec.get("key") != key or rec.get("conflicts") or (exclude is not None and k_ == str(exclude)):
+            continue
+        row = _comp_row(k_, rec)
+        if not row or (mem and row[2] and row[2] != mem):
+            continue
+        hist = price_hist_norm(rec.get("price_hist"))
+        if int(rec.get("last_seen") or 0) - int(rec.get("first_seen") or 0) >= 86400:
+            observed += 1
+            for src_ in ("search", "card"):
+                vals = [h[1] for h in hist if h[2] == src_]
+                if any(b < a for a, b in zip(vals, vals[1:])):
+                    drops += 1
+                    break
+        if mdb_is_active(rec, now):
+            act.append(row)
+        elif rec.get("first_seen") and rec.get("last_seen"):
+            durations.append((int(rec["last_seen"]) - int(rec["first_seen"])) / 86400)
+    prices = sorted(r[1] for r in act)
+
+    def _st(rows):
+        ps = sorted(r[1] for r in rows)
+        return {"n": len(ps), "med": statistics.median(ps), "lo": percentile(ps, 0.1), "hi": percentile(ps, 0.9)} if ps else {"n": 0}
+    by_cat = {}
+    for r in act:
+        by_cat.setdefault(comp_cat(r[3]) or "undefined", []).append(r)
+    by_cat = {c: _st(v) for c, v in by_cat.items()}
+    good = [r for r in act if comp_cat(r[3]) in ("ok", "unk")]
+    bad_ = [r for r in act if comp_cat(r[3]) in ("visible", "faulty")]
+    cvd = (statistics.median([r[1] for r in good]) - statistics.median([r[1] for r in bad_])) if len(good) >= 3 and len(bad_) >= 3 else None
+    regions = {}
+    for r in act:
+        regions.setdefault(r[4], []).append(r[1])
+    regions = {REGION_NAMES[c] or "не указан": statistics.median(v) for c, v in regions.items() if len(v) >= 5}
+    wk = {}
+    stored = (MDB["data"].get("weekly") or {})
+    for k2, ws in list(stored.items()) + list(weekly_from_records(now).items()):
+        if k2.split("|")[0] == key and (not mem or k2.endswith(f"|{mem}")):
+            for w, v in ws.items():
+                cur = wk.get(w)
+                wk[w] = v if not cur or v["n"] >= cur["n"] else cur
+    n = len(prices)
+    return {"n": n, "med": statistics.median(prices) if prices else None, "lo": percentile(prices, 0.1) if prices else None,
+            "hi": percentile(prices, 0.9) if prices else None, "by_cat": by_cat, "clean_vs_defect": cvd, "regions": regions,
+            "weekly": dict(sorted(wk.items())[-8:]), "drop_rate": (drops / observed) if observed else None, "observed": observed,
+            "obs_days": statistics.median(durations) if durations else None,
+            "reliability": "высокая" if n >= 12 else "средняя" if n >= MIN_COMPS else "низкая"}
+
+
+def mdb_stats_line(now=None):
+    """Техническая статистика базы — в журнал (не в Telegram)."""
+    now = now or time.time()
+    ads = _mdb_ads()
+    upd = sum(1 for r in ads.values() if int(r.get("last_seen") or 0) >= now - 86400)
+    changes = sum(price_changes(r.get("price_hist")) for r in ads.values())
+    changes_day = sum(len(price_change_times(r.get("price_hist"), now - 86400)) for r in ads.values())
+    quality = {}
+    for k_, r in ads.items():
+        if r.get("key") and not r.get("conflicts") and _comp_row(k_, r) and mdb_is_active(r, now):
+            quality[r["key"]] = quality.get(r["key"], 0) + 1
+    top = ", ".join(f"{k_} {n}" for k_, n in sorted(quality.items(), key=lambda kv: -kv[1])[:6])
+    cal = calibration(None, now)
+    deals = load_deals()
+    return (f"База рынка: объявлений {len(ads)}, обновлено за сутки {upd}, изменений цены всего {changes} (за сутки {changes_day}), "
+            f"качественных активных аналогов {sum(quality.values())} ({top or 'пока нет'}); подтверждённых сделок {len(deals)}; {cal['text']}")
+
+
+# ---------- Слияние состояния двух запусков (шаг сохранения в GitHub Actions) ----------
+# Если push не прошёл, потому что в main уже есть более новый коммит состояния (другой запуск, ручная правка), workflow
+# вызывает `python <копия бота>/kufar_bot.py --merge-state <папка репозитория>`: файлы рядом с этой копией бота («наши») и файлы
+# в репозитории («их», уже после git reset на свежий main) сливаются по смыслу. Ни одна сторона не затирает другую целиком:
+# отправленные объявления, метки номеров и записи базы остаются от обеих. Сеть не нужна, в Telegram ничего не уходит.
+
+def _merge_hist(a, b):
+    """Объединённая история цены: все наблюдения обеих сторон по времени, без повторов; подряд идущие одинаковые цены
+    одного источника схлопываются (это не изменения)."""
+    rows = sorted({(int(h[0]), float(h[1]), h[2]) for h in price_hist_norm(a) + price_hist_norm(b)})
+    out, last = [], {}
+    for t_, p_, s_ in rows:
+        if last.get(s_) == p_:
+            continue
+        last[s_] = p_
+        out.append([t_, int(p_) if p_ == int(p_) else p_, s_])
+    return out[-16:]
+
+
+def _merge_by_t(a, b, keep):
+    seen_t, out = set(), []
+    for row in sorted([x for x in (a or []) + (b or []) if isinstance(x, dict)], key=lambda x: int(x.get("t") or 0)):
+        sig = json.dumps(row, sort_keys=True, ensure_ascii=False)
+        if sig not in seen_t:
+            seen_t.add(sig)
+            out.append(row)
+    return out[-keep:]
+
+
+def merge_db_records(a, b):
+    """Одна запись базы из двух версий: основа — та, которую видели позже; история цены, даты, оценки и проверки прогнозов —
+    объединяются; отметка «отправлено» не теряется ни с одной стороны."""
+    if not isinstance(a, dict):
+        return b
+    if not isinstance(b, dict):
+        return a
+    newer, older = (a, b) if int(a.get("last_seen") or 0) >= int(b.get("last_seen") or 0) else (b, a)
+    rec = copy.deepcopy(newer)
+    desc_fields = ("defects", "defects_src", "battery", "kit", "conflicts", "condition_cat", "has_desc")
+    if not newer.get("has_desc") and older.get("has_desc"):  # описание видела только старая версия — факты из него берём оттуда
+        for k_ in desc_fields:
+            rec.pop(k_, None)
+            if k_ in older:
+                rec[k_] = copy.deepcopy(older[k_])
+    for k_, v_ in older.items():
+        if k_ not in desc_fields:  # факты описания бот удаляет намеренно (новое описание их не подтвердило) — их не возвращаем
+            rec.setdefault(k_, copy.deepcopy(v_))  # прочие поля, известные только старой версии, не теряем
+    hist = _merge_hist(a.get("price_hist"), b.get("price_hist"))
+    if hist:
+        rec["price_hist"] = hist
+        cur, src_ = price_current(hist)
+        rec["price_byn"] = cur
+        rec["price_src"] = "карточка" if src_ == "card" else "выдача"
+        if isinstance(rec.get("comp"), list) and len(rec["comp"]) == 5 and cur:
+            rec["comp"][0] = int(round(cur))
+    for k_, f_ in (("first_seen", min), ("last_seen", max), ("last_check", max)):
+        vals = [int(r[k_]) for r in (a, b) if isinstance(r.get(k_), (int, float))]
+        if vals:
+            rec[k_] = f_(vals)
+    lts = [x for r in (a, b) for x in [r.get("list_time"), r.get("first_list_time")] + list(r.get("list_time_hist") or [])
+           if isinstance(x, str) and parse_list_time(x) is not None]
+    if lts:
+        rec["first_list_time"] = min(lts, key=parse_list_time)
+        lh = sorted({x for x in lts if x != rec.get("list_time")}, key=parse_list_time)
+        if lh:
+            rec["list_time_hist"] = lh[-5:]
+    sent = [r["notify"] for r in (a, b) if isinstance(r.get("notify"), dict) and r["notify"].get("status") == "sent"]
+    notes = [r["notify"] for r in (a, b) if isinstance(r.get("notify"), dict)]
+    if sent or notes:
+        rec["notify"] = copy.deepcopy(min(sent, key=lambda n: int(n.get("t") or 0)) if sent
+                                      else max(notes, key=lambda n: int(n.get("t") or 0)))
+    for k_, keep in (("appraisals", 5), ("forecast_checks", 5)):
+        m = _merge_by_t(a.get(k_), b.get(k_), keep)
+        if m:
+            rec[k_] = m
+    if not rec.get("publication"):
+        rec.pop("publication", None)
+    return rec
+
+
+def merge_seen_data(ours, theirs):
+    """Два снимка seen.json → один: объединение id (время — последнее), истории, кеша аналогов (новее), меток номеров
+    (в каждом 10-минутном окне — наибольший номер), очереди повторов (без уже отправленного)."""
+    ours, theirs = ours if isinstance(ours, dict) else {}, theirs if isinstance(theirs, dict) else {}
+
+    def ids(d):
+        raw = d.get("seen") or {}
+        if isinstance(raw, list):
+            return {str(x): 0 for x in raw}
+        return {str(k_): int(v_) for k_, v_ in raw.items() if isinstance(v_, (int, float))} if isinstance(raw, dict) else {}
+    seen = ids(theirs)
+    for k_, v_ in ids(ours).items():
+        seen[k_] = max(v_, seen.get(k_, 0))
+    out = dict(theirs, **ours)
+    out["seen"] = dict(sorted(seen.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0))
+    out["history"] = dict(theirs.get("history") or {}, **(ours.get("history") or {}))
+    market = dict(theirs.get("market") or {})
+    for k_, v_ in (ours.get("market") or {}).items():
+        if not isinstance(market.get(k_), dict) or int((v_ or {}).get("t") or 0) >= int(market[k_].get("t") or 0):
+            market[k_] = v_
+    out["market"] = market
+    out["baseline"] = sorted(set(theirs.get("baseline") or []) | set(ours.get("baseline") or []))
+    out["notice"] = max(int(theirs.get("notice") or 0), int(ours.get("notice") or 0))
+    marks = {}
+    for d in (theirs, ours):
+        for b_, v_ in (d.get("marks") or {}).items():
+            if isinstance(v_, list) and len(v_) == 2 and (b_ not in marks or v_[0] > marks[b_][0]):
+                marks[b_] = v_
+    out["marks"] = marks
+    pending = {}
+    for d in (theirs, ours):
+        for k_, v_ in (d.get("pending") or {}).items():
+            if k_ not in seen and isinstance(v_, dict):
+                pending[k_] = v_ if k_ not in pending else min(pending[k_], v_, key=lambda x: int(x.get("t") or 0))
+    out["pending"] = pending
+    return out
+
+
+def merge_state_cli(other_dir):
+    """--merge-state DIR: сливает seen.json и market_history.json из DIR («их») с файлами рядом с этим ботом («наши») и
+    записывает результат рядом с ботом. Код выхода 0 — слито; ненулевой — ничего не изменено (workflow оставит «наши» файлы)."""
+    other = Path(other_dir)
+
+    def read(p):
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    s_ours, s_theirs = read(SEEN_FILE), read(other / SEEN_FILE.name)
+    merged = None
+    if s_ours is not None or s_theirs is not None:
+        s_ours, s_theirs = [_sanitize_seen(d) if isinstance(d, dict) else None for d in (s_ours, s_theirs)]
+        merged = merge_seen_data(s_ours, s_theirs) if s_ours is not None and s_theirs is not None else (s_ours or s_theirs)
+    if s_ours is None and s_theirs is None or merged is None:
+        log("Слияние: действительного seen.json нет ни с одной стороны — не трогаю")
+    else:
+        tmp = SEEN_FILE.with_name(SEEN_FILE.name + ".tmp")
+        tmp.write_text(json.dumps(merged, ensure_ascii=False, separators=(",", ":")))
+        os.replace(tmp, SEEN_FILE)
+        log(f"Слияние seen.json: наших id {len((s_ours or {}).get('seen') or [])}, их {len((s_theirs or {}).get('seen') or [])}, "
+            f"итог {len(merged.get('seen') or [])}")
+    d_ours, d_theirs = read(MARKET_DB_FILE), read(other / MARKET_DB_FILE.name)
+    valid = lambda d: isinstance(d, dict) and isinstance(d.get("ads"), dict)  # noqa: E731
+    d_ours, d_theirs = [_sanitize_db(d) if valid(d) else d for d in (d_ours, d_theirs)]
+    if not valid(d_ours) and not valid(d_theirs):
+        log("Слияние: действительной базы рынка нет ни с одной стороны — базу не трогаю")
+        return 0
+    base = copy.deepcopy(d_theirs if valid(d_theirs) else d_ours)
+    if valid(d_ours) and valid(d_theirs):
+        ads = {k_: merge_db_records(d_ours["ads"].get(k_), d_theirs["ads"].get(k_))
+               for k_ in set(d_ours["ads"]) | set(d_theirs["ads"])}
+        base.update({k_: v_ for k_, v_ in d_ours.items() if k_ != "ads"})
+        weekly = copy.deepcopy(d_theirs.get("weekly") or {})
+        for k_, ws in (d_ours.get("weekly") or {}).items():
+            cur = weekly.setdefault(k_, {})
+            for w, v_ in ws.items():
+                if w not in cur or v_.get("n", 0) >= cur[w].get("n", 0):
+                    cur[w] = v_
+        base["weekly"] = weekly
+        base["backup_t"] = max(int(d_ours.get("backup_t") or 0), int(d_theirs.get("backup_t") or 0))
+        base["ads"] = {k_: v_ for k_, v_ in ads.items() if isinstance(v_, dict)}
+    MDB.update(ok=True, why="", data=base, loaded=0)
+    ups = [parse_list_time(d.get("updated")) for d in (d_ours, d_theirs) if valid(d)]
+    now = max([u for u in ups if u] or [time.time()])
+    if not mdb_save(now):
+        log("Слияние: базу рынка записать не удалось")
+        return 1
+    if not MARKET_DB_BACKUP.exists() and (other / MARKET_DB_BACKUP.name).exists():
+        try:
+            MARKET_DB_BACKUP.write_bytes((other / MARKET_DB_BACKUP.name).read_bytes())
+        except OSError:
+            pass
+    log(f"Слияние базы рынка: наших записей {len((d_ours or {}).get('ads') or {})}, их {len((d_theirs or {}).get('ads') or {})}, "
+        f"итог {len(MDB['data']['ads'])}")
+    return 0
 
 
 # ---------- Основной цикл ----------
@@ -3824,6 +4462,46 @@ class Seen(set):
             self.ts[ad_id] = now
 
 
+def _sanitize_seen(data):
+    """seen.json после ручной правки или сбоя: поля неверного типа отбрасываются (с записью в журнал), а не роняют запуск.
+    Номера в seen — dict {id: время} или список id; history/market/pending/marks — только записи правильной формы."""
+    dropped = []
+    out = dict(data)
+    raw = data.get("seen")
+    if raw is not None and not isinstance(raw, (dict, list)):
+        dropped.append("seen")
+        out["seen"] = []
+    hist = data.get("history")
+    out["history"] = {str(k_): v_ for k_, v_ in hist.items() if isinstance(v_, dict) and _is_num(v_.get("t", 0))} if isinstance(hist, dict) else {}
+    if hist is not None and len(out["history"]) != (len(hist) if isinstance(hist, dict) else -1):
+        dropped.append("history")
+
+    def good_item(it):
+        return isinstance(it, list) and len(it) >= 6 and all(_is_num(x) for x in it[:6])
+    mk = data.get("market")
+    market = {}
+    if isinstance(mk, dict):
+        for k_, v_ in mk.items():
+            if isinstance(v_, dict) and _is_num(v_.get("t")) and isinstance(v_.get("items"), list):
+                market[k_] = {"t": v_["t"], "items": [it for it in v_["items"] if good_item(it)]}
+    if mk is not None and (not isinstance(mk, dict) or len(market) != len(mk)):
+        dropped.append("market")
+    out["market"] = market
+    pend = data.get("pending")
+    out["pending"] = {str(k_): v_ for k_, v_ in pend.items() if str(k_).isdigit() and isinstance(v_, dict)
+                      and _is_num(v_.get("t", 0)) and isinstance(v_.get("ad"), dict)} if isinstance(pend, dict) else {}
+    if pend is not None and len(out["pending"]) != (len(pend) if isinstance(pend, dict) else -1):
+        dropped.append("pending")
+    base = data.get("baseline")
+    out["baseline"] = [q for q in base if isinstance(q, str)] if isinstance(base, list) else base
+    if not _is_num(data.get("notice", 0)) and data.get("notice") is not None:
+        dropped.append("notice")
+        out["notice"] = 0
+    if dropped:
+        log("seen.json: испорченные поля отброшены (запуск продолжается):", ", ".join(dropped))
+    return out
+
+
 def load_seen():
     """Поддерживает новый формат seen={id: timestamp} и старые форматы списков id. None = первый запуск."""
     try:
@@ -3834,7 +4512,8 @@ def load_seen():
         data = {"seen": data}
     if not isinstance(data, dict):
         return None
-    HISTORY.update(data.get("history") or {})
+    data = _sanitize_seen(data)
+    HISTORY.update(data["history"])
     raw = data.get("seen") or []
     now = int(time.time())
     seen = Seen()
@@ -3855,7 +4534,10 @@ def load_seen():
     base = data.get("baseline")
     # файл от старой версии: запросы iphone/samsung/ipod touch уже «запомнены», остальные запомним молча при первом заходе
     STATE["baseline"] = list(base) if isinstance(base, list) else (list(LEGACY_QUERIES) if seen else [])
-    STATE["notice"] = int(data.get("notice") or 0)
+    try:
+        STATE["notice"] = int(data.get("notice") or 0)
+    except (TypeError, ValueError):  # поле испорчено (ручная правка) — не роняем каждый запуск, уведомление просто придёт ещё раз
+        STATE["notice"] = 0
     pending = data.get("pending")
     STATE["pending"] = pending if isinstance(pending, dict) else {}
     marks = data.get("marks")
@@ -4142,6 +4824,7 @@ def cycle(seen, first_run):
             why.setdefault(reason, []).append(aid)
         else:
             cands[aid] = ad
+            mdb_mark_publication(aid, ad, now)
     if first_run:
         log(f"Первый запуск: запомнил {len(found)} объявлений (подходящие — как уже существующие), уведомлений не шлю")
         return ok_queries, len(queries)
@@ -4217,7 +4900,32 @@ def cycle(seen, first_run):
             time.sleep(SEND_PAUSE)  # Telegram не любит очереди из десятков сообщений подряд
         else:
             mdb_note(aid, "failed", "Telegram отклонил текст сообщения")
+    if ok_queries:
+        market_rotation(time.time())  # процесс B: сбор рынка — только после уведомлений и только если осталось время
     return ok_queries, len(queries)
+
+
+def market_rotation(now):
+    """Процесс B: обновляет выдачу по MARKET_ROTATE моделям, чей кеш аналогов старше MARKET_TTL_HOURS (самые давние — первыми).
+    Ничего не отправляет: увиденное идёт в базу рынка и в кеш аналогов. Не трогает время уведомлений (вызывается после них)."""
+    keys = {k_ for k_ in STATE["market"]} | {r.get("key") for r in _mdb_ads().values() if r.get("key")}
+    due = sorted((int((STATE["market"].get(k_) or {}).get("t") or 0), k_) for k_ in keys if k_ and market_query(k_))
+    done = 0
+    for t_, key_ in due:
+        if done >= MARKET_ROTATE or now - t_ < MARKET_TTL_H * 3600:
+            break
+        if RUN["deadline"] and time.time() > RUN["deadline"] - 20:
+            break
+        try:
+            items = refresh_market(key_)
+            STATE["market"][key_] = {"t": int(time.time()), "items": items[:150]}
+            done += 1
+            time.sleep(KUFAR_PAUSE)
+        except Exception as e:
+            log(f"Сбор рынка: выдачу «{key_}» обновить не удалось:", e)
+            break
+    if done:
+        log(f"Сбор рынка: обновил аналоги по {done} модел{'и' if done == 1 else 'ям'}")
 
 
 def dry_run():
@@ -4272,6 +4980,7 @@ def dry_run():
         sys.exit("Куфар не ответил ни на один запрос")
     log("Свежесть подходящих объявлений в выдаче: " + "; ".join(
         f"{'свежие (ушли бы)' if r == 'fresh' else SKIP_RU.get(r, r)} — {len(v)}" for r, v in sorted(why.items())))
+    log(mdb_stats_line())
     log(f"Тестовый запуск закончен: показано объявлений — {len(shown)}")
 
 
@@ -4303,6 +5012,11 @@ NOTICE_TEXT = (
 
 
 def main():
+    if "--merge-state" in sys.argv:  # шаг сохранения в workflow: без сети, без Telegram, без ключей
+        i = sys.argv.index("--merge-state")
+        if i + 1 >= len(sys.argv):
+            sys.exit("Использование: kufar_bot.py --merge-state ПАПКА_С_ДРУГОЙ_ВЕРСИЕЙ_СОСТОЯНИЯ")
+        sys.exit(merge_state_cli(sys.argv[i + 1]))
     if DRY_RUN:
         return dry_run()
     if not TG_TOKEN:
@@ -4348,6 +5062,7 @@ def main():
                 log("Не отправилось уведомление об обновлении, попробую позже:", e)
         save_seen(seen)
         mdb_save()
+        log(mdb_stats_line())
         return
 
     tg_send("✅ Мониторинг Куфара запущен: " + ", ".join(QUERIES))
