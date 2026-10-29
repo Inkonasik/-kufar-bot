@@ -24,6 +24,10 @@ jobs:
     steps:
       - name: Получить код репозитория
         uses: actions/checkout@v7
+        with:
+          # Свежая вершина main в момент старта, а не коммит на момент вызова. Без этого запуск, который ждал в очереди
+          # (concurrency), начинал бы со снимка seen.json и базы ДО коммита предыдущего запуска.
+          ref: main
 
       - name: Установить Python
         uses: actions/setup-python@v7
@@ -53,15 +57,18 @@ jobs:
 
       # always(): даже если шаг выше упал или завершился по таймауту, уже обработанные объявления сохраняются
       # (бот пишет seen.json и базу после каждого отправленного сообщения), и они не придут повторно.
-      # Оба файла — в одном коммите. Бот пишет их атомарно (временный файл + замена), так что обрыв не оставит половину файла.
+      # Файлы состояния — в одном коммите. Бот пишет их атомарно (временный файл + замена), так что обрыв не оставит половину файла.
+      # В тестовом запуске (dry_run) шаг не выполняется вовсе: живое состояние не меняется.
       - name: Сохранить состояние и базу рынка
-        if: always()
+        if: always() && !inputs.dry_run
+        timeout-minutes: 3
         run: |
           git config user.name "kufar-bot"
           git config user.email "kufar-bot@users.noreply.github.com"
 
+          STATE_FILES="seen.json market_history.json market_history.backup.json"
           FILES=""
-          for f in seen.json market_history.json; do
+          for f in $STATE_FILES; do
             if [ -f "$f" ]; then FILES="$FILES $f"; fi
           done
           if [ -z "$FILES" ]; then
@@ -70,23 +77,44 @@ jobs:
           fi
 
           git add -- $FILES
-
           if git diff --cached --quiet; then
             echo "Изменений в состоянии нет."
             exit 0
           fi
+          git commit -q -m "update seen and market history"
 
-          git commit -m "update seen and market history"
-
-          # 5 попыток с растущей паузой: сеть GitHub иногда сбоит, а в main могут прийти твои коммиты (тогда rebase;
-          # при конфликте в seen.json / market_history.json побеждает только что записанное ботом состояние)
+          # Push не прошёл — значит, в main появился более новый коммит (твоя правка или состояние другого запуска).
+          # Тогда НЕ перезаписываем одну версию другой: берём свежий main и сливаем состояние по смыслу
+          # (kufar_bot.py --merge-state: отправленные объявления, метки и записи базы остаются от обеих версий).
+          # Слияние делает копия бота ЭТОГО запуска — файлы рядом с ней и есть «наше» состояние.
+          OURS="${RUNNER_TEMP:-/tmp}/kufar_ours"
+          rm -rf "$OURS"
+          mkdir -p "$OURS"
+          cp kufar_bot.py "$OURS/"
           for attempt in 1 2 3 4 5; do
             if git push origin HEAD:main; then
               exit 0
             fi
-            echo "Push не прошёл (попытка $attempt из 5). Подтягиваю main и повторяю."
-            git pull --rebase -X theirs origin main || git rebase --abort || true
+            echo "Push не прошёл (попытка $attempt из 5). Беру свежий main и сливаю состояние."
             sleep $((attempt * 3))
+            git fetch --depth=1 origin +refs/heads/main:refs/remotes/origin/main || continue
+            for f in $STATE_FILES; do
+              if [ -f "$f" ]; then cp "$f" "$OURS/"; fi
+            done
+            git reset -q --hard origin/main
+            if python "$OURS/kufar_bot.py" --merge-state "$PWD"; then
+              echo "Состояние этого запуска слито с версией из main."
+            else
+              echo "Слить не удалось — сохраняю состояние этого запуска как есть."
+            fi
+            for f in $STATE_FILES; do
+              if [ -f "$OURS/$f" ]; then cp "$OURS/$f" "$f"; git add -- "$f"; fi
+            done
+            if git diff --cached --quiet; then
+              echo "После слияния сохранять нечего: в main уже то же самое."
+              exit 0
+            fi
+            git commit -q -m "update seen and market history (merged)"
           done
 
           echo "Не удалось сохранить состояние. Следующий запуск начнёт с прошлой версии; повторов не будет:"
