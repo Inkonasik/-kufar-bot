@@ -1,0 +1,4 @@
+# временные файлы бота (в репозиторий коммитятся только seen.json и market_history.json — их добавляет workflow)
+.kufar_bot.lock
+*.tmp
+__pycache__/
